@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 type Pool struct {
@@ -39,6 +39,11 @@ type Pool struct {
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
 	pickSeq uint64
+	// defaultUID 「默认账号」UID（空 = 未设置，行为与引入前完全一致）。
+	// 非空时 pick 优先直取该号：它 healthy 且未占满在途名额就用它，否则**静默回落**
+	// 普通加权轮换（不报错、不等待）——默认号冷却/禁用时请求仍能成功，只是不再"钉"在它上面。
+	// 由面板开关设置（SetDefaultUID），随 state.json 持久化（重启保留）。
+	defaultUID string
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -183,6 +188,53 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.randInt64N = fn
+}
+
+// SetDefaultUID 设置/清除「默认账号」。uid 为空 = 清除（回到纯加权轮换）。
+// 不校验 uid 是否存在：面板只在已存在账号上调用；即便传入未知 uid，pick 侧
+// 的 healthy 判定也会自然跳过它（等价于未设置），不会造成路由异常。
+// 返回是否有实际变更（供调用方决定是否记日志/提示）。
+func (p *Pool) SetDefaultUID(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.defaultUID == uid {
+		return false
+	}
+	p.defaultUID = uid
+	p.dirty.Store(true)
+	return true
+}
+
+// DefaultUID 返回当前默认账号 UID（未设置返回空串）。供 /status 与面板展示。
+func (p *Pool) DefaultUID() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.defaultUID
+}
+
+// DefaultUIDIfUsable 返回「当前对 model 可用」的默认账号 UID；未设置或不可用时返回空串。
+// 可用 = 健康（含 realm 与 6004 模型豁免口径）+ 在途未满。供调用方判断是否要让默认号
+// 优先于其他路由决策（如会话粘性）——不可用时返回空串，调用方照常走既有逻辑，
+// 默认号的存在不会削弱原有语义。model 为空时用账号级健康口径。
+func (p *Pool) DefaultUIDIfUsable(model string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.defaultUID == "" {
+		return ""
+	}
+	e, ok := p.byUID[p.defaultUID]
+	if !ok {
+		return ""
+	}
+	now := time.Now()
+	healthy := e.healthy(now)
+	if model != "" {
+		healthy = e.healthyForModel(now, model)
+	}
+	if !healthy || p.inFlightFull(e) {
+		return ""
+	}
+	return p.defaultUID
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。

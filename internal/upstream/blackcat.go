@@ -13,7 +13,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 // InNightWindow 当前是否处于夜猫子计数窗口（23:00–08:00 本地时区）。

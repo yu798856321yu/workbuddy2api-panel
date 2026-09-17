@@ -110,6 +110,13 @@ function formatRate(rate) {
   return n.toFixed(1) + 'tok/s';
 }
 
+// 真实扣费（上游 usage.credit）：整数直出，小数保留 2 位（上游会给 0.0004 这种量级）。
+function fmtCredit(v) {
+  const n = Number(v || 0);
+  if (!Number.isFinite(n)) return '0';
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
 function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
 $('btnKey').onclick = async () => {
@@ -135,7 +142,7 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
-  if (v === 'usage') loadUsage();
+  if (v === 'usage') { loadUsage(); loadRecent(); }
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
@@ -144,9 +151,9 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 function renderAccounts(list) {
-  const tb = $('accBody');
-  if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    const tb = $('accBody');
+    if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -175,12 +182,35 @@ function renderAccounts(list) {
     const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
-    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    // 真实扣费（上游 usage.credit 累计）：0 是合法观测，与"上游没给"（无样本）区分展示。
+    const credUsed = tu.credits_used || 0;
+    const credN = tu.credits_samples || 0;
+    const credLine = credN > 0 ? ' / 扣费 ' + fmtCredit(credUsed) + '（' + credN + ' 次有数据）' : '';
+    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate + credLine;
+    // 快过期积分（两档互斥）：一档 ≤7 天（最紧迫，红色），二档 ≤15 天（次紧迫，黄色）。
+    // 都为 0 时显示 —（无快过期积分是常态，避免整列噪音）。
+    const exp7 = s.credits_expiring_7d || 0;
+    const exp15 = s.credits_expiring_15d || 0;
+    let expCell;
+    if (exp7 > 0) {
+      expCell = '<span class="tag bad" title="' + exp7 + ' 积分 7 天内到期（最紧迫），选号最优先消耗该账号">7d · ' + exp7 + '</span>';
+      if (exp15 > 0) expCell += ' <span class="tag warn" title="' + exp15 + ' 积分 15 天内到期">15d · ' + exp15 + '</span>';
+    } else if (exp15 > 0) {
+      expCell = '<span class="tag warn" title="' + exp15 + ' 积分 15 天内到期，选号优先消耗该账号">15d · ' + exp15 + '</span>';
+    } else {
+      expCell = '<span style="color:var(--ink-3)">—</span>';
+    }
+    // 默认账号开关：★ 已设为默认（点击取消）；☆ 未设置（点击设为默认）。
+    const defBtn = '<button class="xs ' + (s.default ? 'primary' : 'ghost') + '" data-a="default" data-u="' + esc(s.uid) + '"'
+      + (s.default ? ' data-on="1"' : '')
+      + ' title="' + (s.default ? '当前为默认账号：普通请求优先使用它。点击取消' : '设为默认账号：普通请求优先使用它（该号不可用时自动回落轮换）') + '">'
+      + (s.default ? '★ 默认' : '☆ 默认') + '</button>';
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="num">' + expCell + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
@@ -188,9 +218,11 @@ function renderAccounts(list) {
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+        (credN > 0 ? '<span class="usage-item usage-credit"><b>' + fmtCredit(credUsed) + '</b><em>cr</em></span>' : '') +
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
+        defBtn +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
@@ -243,6 +275,14 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');
+    } else if (a === 'default') {
+      // 开关语义：已默认 → 取消（default:false）；未默认 → 设为默认。
+      const isDefault = !!b.dataset.on;
+      const r = await api('accounts/' + encodeURIComponent(u) + '/default', {
+        method: 'POST',
+        body: JSON.stringify({ default: !isDefault }),
+      });
+      toast(r.default_uid ? '已设为默认账号：普通请求优先使用它（不可用时自动回落轮换）' : '已取消默认账号，回到自动轮换', 'ok');
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
@@ -385,6 +425,7 @@ const CFG_MAP = {
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
+  expiring_soon_7d: ['pool', 'expiring_soon_7d'], expiring_soon_15d: ['pool', 'expiring_soon_15d'],
   ttl: ['session_sticky', 'ttl'],
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
   idle_timeout_seconds: ['upstream', 'idle_timeout_seconds'], user_agent: ['upstream', 'user_agent'],
@@ -531,6 +572,7 @@ $('btnRefresh').onclick = async () => {
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
+  else if (view === 'usage') { loadUsage(true); loadRecent(true); }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') pollQueueOnce();
 }
@@ -1187,6 +1229,7 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + fmtCreditCell(a.credits, a.credit_samples) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -1194,13 +1237,30 @@ function usRow(name, sub, a, mid, withPerf) {
     '</tr>';
 }
 
+/* fmtCreditCell 积分消耗单元格。上游只在部分请求的末帧返回 usage.credit，
+   因此「有数据的样本数」必须一起展示：样本为 0 时显示 —（而不是 0，避免
+   把"没采集到"误读成"没消耗"）。 */
+function fmtCreditCell(credits, samples) {
+  const n = Number(samples || 0);
+  if (!n) return '<span style="color:var(--ink-3)">—</span>';
+  return '<span title="' + n + ' 次请求返回了真实扣费（其余请求上游未提供该字段）">' +
+    fmtCredit(credits) + '</span>';
+}
+
 function renderUsage(d) {
   const t = d.totals || {};
+  // 积分消耗样本为 0 时显示 —：上游只在部分请求的末帧返回 usage.credit，
+  // "没采集到"与"没消耗"必须区分（否则会被误读成免费）。
+  const credSamples = Number(t.credit_samples || 0);
+  const credStat = credSamples > 0
+    ? usStat(fmtCredit(t.credits), '积分消耗 · ' + credSamples + ' 次有数据')
+    : usStat('—', '积分消耗 · 无数据');
   $('usStats').innerHTML =
     usStat(fmtTok(t.requests), '请求数') +
     usStat(fmtTok(t.total_tokens), '总 token') +
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
+    credStat +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
@@ -1211,15 +1271,17 @@ function renderUsage(d) {
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
 
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   renderUsageChart(d.series || []);
+  renderCreditChart(d.series || []);
+  renderLatencyChart(d.series || []);
 }
 
 /* renderUsageChart 画堆叠柱状图。日点与小时点混用 x 轴，因此按数据序号等距
@@ -1260,6 +1322,11 @@ function renderUsageChart(series) {
       '" width="' + bw.toFixed(1) + '" height="' + hP.toFixed(1) + '" fill="var(--accent)" rx="1.5"/>';
     if (hC > 0) out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - hP - hC).toFixed(1) +
       '" width="' + bw.toFixed(1) + '" height="' + hC.toFixed(1) + '" fill="var(--ok)" rx="1.5"/>';
+    // 整列透明命中区：鼠标落在这一列任意高度都能弹数值，不必精确指到柱子。
+    out += '<rect class="hit" x="' + (PL + i * step).toFixed(1) + '" y="' + PT +
+      '" width="' + step.toFixed(1) + '" height="' + ih + '" data-tip="' +
+      esc(p.t + ' (' + p.scope + ')  ' + fmtTok(p.prompt_tokens) + ' prompt / ' +
+        fmtTok(p.completion_tokens) + ' completion / ' + (p.requests || 0) + ' 次') + '"/>';
     // 只给稀疏的几根画标签，避免拥挤
     const every = Math.ceil(series.length / 8);
     if (i % every === 0) {
@@ -1267,28 +1334,200 @@ function renderUsageChart(series) {
       out += '<text class="tk" x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 8) +
         '" text-anchor="middle">' + esc(lab) + '</text>';
     }
-    out += '<title>' + esc(p.t) + ' (' + esc(p.scope) + ')  ' +
-      fmtTok(p.prompt_tokens) + ' prompt / ' + fmtTok(p.completion_tokens) + ' completion / ' +
-      (p.requests || 0) + ' 次</title>';
   });
   out += '</svg>';
   host.innerHTML = out;
+  chartTip(host);
 }
 
 function fmtTokTip(v) { return fmtTok(v); }
 
-async function loadUsage() {
+/* chartTip 给图表挂一个跟随鼠标的数值浮层。原来每根柱子只带一个 SVG <title>
+   原生提示：位置还挂在柱子外层，既弹不出来也慢。这里改成"整列命中区 + 自绘
+   浮层"——移上去立刻显示该点数值，离开就隐藏。
+   浮层是宿主元素内的绝对定位子节点，渲染时会随 innerHTML 一起被清掉，因此
+   每次画完都要重新调用本函数；事件只绑定一次，避免定时刷新累积监听器。 */
+function chartTip(host) {
+  if (!host.querySelector('.us-tip')) {
+    const el = document.createElement('div');
+    el.className = 'us-tip';
+    host.appendChild(el);
+  }
+  if (host.dataset.tipBound) return;
+  host.dataset.tipBound = '1';
+  host.addEventListener('mousemove', e => {
+    const tip = host.querySelector('.us-tip');
+    if (!tip) return;
+    const hit = e.target && e.target.closest ? e.target.closest('.hit') : null;
+    if (!hit) { tip.classList.remove('on'); return; }
+    tip.textContent = hit.getAttribute('data-tip') || '';
+    tip.classList.add('on');
+    const box = host.getBoundingClientRect();
+    // 靠近右/上边缘时翻到另一侧，避免浮层被容器裁掉
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    const x = e.clientX - box.left, y = e.clientY - box.top;
+    tip.style.left = Math.max(0, Math.min(box.width - tw, x + 12)) + 'px';
+    tip.style.top = Math.max(0, y - th - 10) + 'px';
+  });
+  host.addEventListener('mouseleave', () => {
+    const tip = host.querySelector('.us-tip');
+    if (tip) tip.classList.remove('on');
+  });
+}
+
+/* ── 通用折线/柱状画布 ───────────────────────────────────────────────
+   renderMetricChart 是积分与延迟两个图表的共用底座。与 renderUsageChart
+   （堆叠柱）的区别：这里画的是**单值指标**，用柱高表示，且要处理"缺数据"
+   的点——上游并非每次请求都返回 credit，延迟也可能因失败请求缺失。缺数据
+   的点不画柱、不连零，避免把"没采集到"画成"消耗为 0"。 */
+function renderMetricChart(hostId, series, opt) {
+  const host = $(hostId);
+  if (!host) return;
+  const pts = series.map(opt.value).map((v, i) => ({ v: v, p: series[i] }));
+  const valid = pts.filter(x => x.v != null);
+  if (!valid.length) {
+    host.innerHTML = '<div class="us-empty">' + esc(opt.empty || '暂无数据') + '</div>';
+    return;
+  }
+
+  const W = 760, H = 150, PL = 52, PR = 10, PT = 12, PB = 26;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const max = Math.max(1e-9, ...valid.map(x => Number(x.v) || 0));
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5) + '" text-anchor="end">' +
+      esc(opt.fmt(max * i / 4)) + '</text>';
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  const step = iw / series.length;
+  const bw = Math.max(2, Math.min(26, step - 3));
+  const yBase = PT + ih;
+  const every = Math.ceil(series.length / 8);
+  series.forEach((p, i) => {
+    const x = PL + i * step + (step - bw) / 2;
+    const v = pts[i].v;
+    if (v != null) {
+      const h = Math.max(1, ih * ((Number(v) || 0) / max));
+      out += '<rect x="' + x.toFixed(1) + '" y="' + (yBase - h).toFixed(1) +
+        '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1) +
+        '" fill="' + opt.color + '" rx="1.5"/>';
+    }
+    // 整列透明命中区（含"无数据"的点，便于看出该时段确实没有采集到）。
+    out += '<rect class="hit" x="' + (PL + i * step).toFixed(1) + '" y="' + PT +
+      '" width="' + step.toFixed(1) + '" height="' + ih + '" data-tip="' +
+      esc(p.t + ' (' + p.scope + ')  ' + (v == null ? '无数据' : opt.fmt(v))) + '"/>';
+    if (i % every === 0) {
+      const lab = p.scope === 'day' ? p.t.slice(5) : p.t.slice(11) + ':00';
+      out += '<text class="tk" x="' + (x + bw / 2).toFixed(1) + '" y="' + (H - 8) +
+        '" text-anchor="middle">' + esc(lab) + '</text>';
+    }
+  });
+  out += '</svg>';
+  host.innerHTML = out;
+  chartTip(host);
+}
+
+/* renderCreditChart 积分消耗时序。只画"上游确实返回了 credit"的点（>0 才画），
+   因为 0 与"未采集"在此口径下无法区分，画成 0 会误导。 */
+function renderCreditChart(series) {
+  renderMetricChart('usCreditChart', series, {
+    color: 'var(--warn)',
+    empty: '暂无积分消耗数据。上游仅对部分请求返回真实扣费（usage.credit）。',
+    value: p => (Number(p.credit_samples || 0) > 0 ? Number(p.credits || 0) : null),
+    fmt: v => fmtCredit(v),
+  });
+}
+
+/* renderLatencyChart 平均延迟时序。avg_latency_ms 由后端按样本数加权算出；
+   无延迟样本的点（全是失败尝试）返回 0，这里视作"无数据"。 */
+function renderLatencyChart(series) {
+  renderMetricChart('usLatencyChart', series, {
+    color: 'var(--accent)',
+    empty: '暂无延迟数据。',
+    value: p => (Number(p.avg_latency_ms || 0) > 0 ? Number(p.avg_latency_ms) : null),
+    fmt: v => fmtMs(v),
+  });
+}
+
+/* ── 实时请求 ─────────────────────────────────────────────────────── */
+/* 结构化字段直接渲染，不解析日志文本。积分列用 has_credits 区分"上游没给"
+   （显示 —）与"确实扣了 0"——二者在成本判断上是两回事。 */
+function renderRecent(rows) {
+  const tb = $('usRecentBody');
+  if (!tb) return;
+  if (!rows || !rows.length) {
+    tb.innerHTML = '<tr><td colspan="12" class="empty">暂无请求。发起一次对话后再刷新。</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(r => {
+    const st = Number(r.status || 0);
+    const stCls = st >= 200 && st < 300 ? '' : (st >= 500 ? 'bad' : 'warn');
+    const stCell = '<span' + (stCls ? ' style="color:var(--' + stCls + ')"' : '') + '>' + st + '</span>';
+    // token < 0 = 上游未给 usage（失败/中断），显示 — 而不是 0。
+    const tokCell = Number(r.tokens) >= 0 ? fmtTok(r.tokens) : '<span style="color:var(--ink-3)">—</span>';
+    const rateCell = Number(r.tokens) >= 0 && r.tokens_per_sec ? fmtRate(r.tokens_per_sec) : '—';
+    const ttfbCell = r.ttfb_ms > 0 ? fmtMs(r.ttfb_ms) : '<span style="color:var(--ink-3)">—</span>';
+    const crCell = r.has_credits
+      ? fmtCredit(r.credits)
+      : '<span style="color:var(--ink-3)" title="上游未返回 usage.credit">—</span>';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td class="num" style="color:var(--ink-3)">' + r.seq + '</td>' +
+      '<td>' + esc(hhmmss(r.at)) + '</td>' +
+      '<td>' + esc(r.model || '-') + '</td>' +
+      '<td>' + esc(r.mode || '-') + '</td>' +
+      '<td class="num">' + stCell + '</td>' +
+      '<td>' + esc(r.uid || '-') + '</td>' +
+      '<td class="num">' + ttfbCell + '</td>' +
+      '<td class="num">' + tokCell + '</td>' +
+      '<td class="num">' + rateCell + '</td>' +
+      '<td class="num">' + crCell + '</td>' +
+      '<td class="num">' + fmtMs(r.total_ms) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+// hhmmss 取 ISO 时间的时分秒（请求流只需要当天的时刻，日期由"最近 N 条"隐含）。
+function hhmmss(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+async function loadRecent(quiet) {
+  try {
+    const d = await api('recent');
+    renderRecent(d.requests || []);
+  } catch (e) {
+    if (quiet) return;
+    $('usRecentBody').innerHTML =
+      '<tr><td colspan="12" class="empty">读取实时请求失败：' + esc(e.message) + '</td></tr>';
+  }
+}
+
+/* loadUsage 拉取用量聚合并渲染。
+   quiet=true 是后台轮询（5 秒一次）用的：失败时**不动**页面内容，
+   避免网络抖动把已经渲染好的图表清成错误提示。 */
+async function loadUsage(quiet) {
   const hours = ($('usWindow') && $('usWindow').value) || 72;
   try {
     const d = await api('usage?hours=' + encodeURIComponent(hours));
     renderUsage(d);
   } catch (e) {
+    if (quiet) return;
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
   }
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
+if ($('btnRecent')) $('btnRecent').onclick = () => loadRecent();
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

@@ -16,24 +16,44 @@ func (p *Pool) SetCredits(uid string, credits, total int64) {
 	}
 }
 
-// SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
-// 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
-// 不污染权重。
-func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
+// SetCreditsDetailed 更新账号余额/总额 + 两档快过架子集（签到与余额刷新时调用，
+// 供选号优先消耗快过期积分）。
+//
+// 钳制规则（防上游分桶异常污染权重）：
+//   - 各档先钳到 [0, credits]；
+//   - 两档之和超过 credits 时按比例回缩（保 7d 档优先——它更紧迫），
+//     保证 7d + 15d ≤ credits，即"快过期积分"始终是总余额的子集。
+func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring7d, expiring15d int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if expiring < 0 {
-			expiring = 0
-		}
-		if expiring > credits {
-			expiring = credits
-		}
-		e.credits = credits
-		e.creditsTotal = total
-		e.creditsExpiring = expiring
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	if expiring7d < 0 {
+		expiring7d = 0
+	}
+	if expiring15d < 0 {
+		expiring15d = 0
+	}
+	if expiring7d > credits {
+		expiring7d = credits
+	}
+	if expiring15d > credits {
+		expiring15d = credits
+	}
+	// 两档互斥且都属于 credits：和超了说明上游分桶异常，保 7d 档、回缩 15d 档。
+	if sum := expiring7d + expiring15d; sum > credits {
+		expiring15d = credits - expiring7d
+		if expiring15d < 0 {
+			expiring15d = 0
+		}
+	}
+	e.credits = credits
+	e.creditsTotal = total
+	e.creditsExpiring7d = expiring7d
+	e.creditsExpiring15d = expiring15d
+	p.dirty.Store(true)
 }
 
 // Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。

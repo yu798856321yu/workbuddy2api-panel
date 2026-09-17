@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 var flushInterval = 5 * time.Second
@@ -109,6 +109,7 @@ func (p *Pool) load() {
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	p.defaultUID = sf.DefaultUID
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -121,10 +122,19 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
+		// 旧版单档 credits_expiring 迁移：并入 15d 档（旧口径默认窗口 7 天，最接近
+		// 15d 档语义；并入 7d 档会虚高紧迫度、让旧数据影响选号权重）。新字段有值时
+		// 以新字段为准（旧字段已不再回写，只会出现在升级前的 state.json 里）。
+		exp15 := s.CreditsExpiring15d
+		if exp15 == 0 && s.CreditsExpiring7d == 0 && s.CreditsExpiring > 0 {
+			exp15 = s.CreditsExpiring
+		}
 		p.byUID[uid] = &entry{
 			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:      s.Credits,
 			creditsTotal: s.CreditsTotal,
+			creditsExpiring7d:  s.CreditsExpiring7d,
+			creditsExpiring15d: exp15,
 			disabled:     s.Disabled,
 			reason:       s.Reason,
 			until:        s.Until,
@@ -196,11 +206,15 @@ func (p *Pool) notePersistFail(err error) {
 
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
-	sf := stateFile{Accounts: map[string]stateAccount{}}
+	sf := stateFile{Accounts: map[string]stateAccount{}, DefaultUID: p.defaultUID}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
 			Credits:      e.credits,
 			CreditsTotal: e.creditsTotal,
+			// credits_expiring_7d/15d 持久化：它们是签到时按窗口算出的运行态观测，重启后到
+			// 下次签到/余额刷新前仍有效；不持久化会让重启后"快过期优先"静默失效一段时间。
+			CreditsExpiring7d:  e.creditsExpiring7d,
+			CreditsExpiring15d: e.creditsExpiring15d,
 			Disabled:     e.disabled,
 			Reason:       e.reason,
 			Until:        e.until,

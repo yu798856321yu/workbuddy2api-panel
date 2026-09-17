@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/upstream"
 )
 
 // travelStub 模拟 growth 域全部端点，记录调用次数与请求参数。

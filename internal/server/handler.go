@@ -14,14 +14,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/httpauth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/livecfg"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/prompt"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/session"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/upstream"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/usage"
 )
 
 // Config handler 依赖。
@@ -438,7 +438,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级——提取本身与粘性无关。
 	sessKey := session.ExtractKey(body)
 	stickyUID := ""
-	if h.cfg.Session != nil && sessKey != "" {
+	// 默认账号优先于会话粘性：面板显式指定的号，其意图强于"这个会话之前用过谁"。
+	// 否则粘性绑定会先返回旧号、请求永远走不到选号里的默认号短路（默认开关形同虚设）。
+	// 仅当默认号**当前可用**时才让路：不可用（冷却/禁用/占满/该模型被 6004 限额）时
+	// 粘性照常生效，既有语义不被削弱（DefaultUIDIfUsable 一次读锁内判定）。
+	if h.cfg.Pool.DefaultUIDIfUsable(peek.Model) == "" && h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
 		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
@@ -514,6 +518,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasCompletion:    delta.HasCompletionTokens,
 				TotalTokens:      delta.TotalTokens,
 				HasTotal:         delta.HasTotalTokens,
+				Credits:          delta.Credits,
+				HasCredits:       delta.HasCredits,
 				LatencyMs:        delta.LatencyMs,
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
@@ -676,6 +682,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			if c, ok := stats.Credits(); ok {
+				st.credits = c
+			}
 			rc.Close()
 			return
 		}
@@ -692,6 +701,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		// 非流式的扣费同样来自 usage.credit（本地聚合保留了末帧 usage）。
+		if u, ok := resp["usage"].(map[string]any); ok {
+			if c, ok2 := readCredit(u["credit"]); ok2 {
+				st.credits = c
+			}
+		}
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"

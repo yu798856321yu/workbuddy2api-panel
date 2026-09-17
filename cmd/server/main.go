@@ -17,20 +17,20 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/livecfg"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/panel"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/redisstore"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/scheduler"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/server"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/session"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/upstream"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.9.2-panel"
+// appVersion 网关版本（基于上游 v1.9.2-panel，含本地积分与用量功能补齐），透出到 /panel/api/overview。
+const appVersion = "1.9.3-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -155,8 +155,8 @@ func main() {
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
-		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
-		ExpiringSoonWindow: cfg.ExpiringSoonDur,
+		// 快过期积分优先消耗：签到/余额刷新按两档窗口分桶（7 天 / 15 天）。
+		ExpiringBuckets: cfg.ExpiringBuckets(),
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
 		TravelDisabled:     !cfg.Schedule.TravelEnabled,
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
@@ -233,7 +233,10 @@ func main() {
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
-		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
+		ProbeFile: stateSibling(cfg.StateFile, "output_probes.json"),
+		// 两档快过期积分窗口（与调度器同源）：面板单号签到/余额刷新按它给积分数分桶，
+		// 供选号优先消耗快到期积分。
+		ExpiringBuckets: cfg.ExpiringBuckets(),
 		ConfigPath:  *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)

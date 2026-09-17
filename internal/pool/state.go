@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 func (p *Pool) Disable(uid, reason string) {
@@ -177,6 +177,13 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	}
 	if known {
 		usage.UsageCount++
+	}
+	// 真实扣费：只在上游确实返回时累计（HasCredits=false 不碰，避免把"没数据"
+	// 混进均值）。LastCredits 仅在有值时更新，缺失时保留上一次观测。
+	if delta.HasCredits && delta.Credits >= 0 {
+		usage.CreditsUsed += delta.Credits
+		usage.CreditsSamples++
+		usage.LastCredits = delta.Credits
 	}
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		usage.LastLatencyMs = delta.LatencyMs
@@ -395,6 +402,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
+		CreditsExpiring7d:  e.creditsExpiring7d,
+		CreditsExpiring15d: e.creditsExpiring15d,
+		Default:           uid == p.defaultUID,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,

@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -1077,8 +1077,21 @@ type CreditPackage struct {
 	Remain int64  `json:"remain"`
 	Used   int64  `json:"used"`
 	Size   int64  `json:"size"`
-	// EndTime 该包的周期结束时间（上游 ExpiredTime / PackageEndTime 二者取有值者）。
+	// EndTime 该包的到期时间。取值优先级：CycleEndTime > ExpiredTime > PackageEndTime。
+	//
+	// **实测（2026-09-16，3 账号直连上游核对）**：有余额的包 ExpiredTime / PackageEndTime
+	// 恒为空（27/27、5/5 全空），只有**已用完**的包才带这两个字段——按旧口径读会让
+	// 「剩余积分的到期时间」永远为空，expiring 分桶（pool 优先消耗快过期积分）恒 0，
+	// 快过期优先权等于死逻辑。真正的到期时间在 CycleEndTime（周期包）与
+	// DeductionEndTime（抵扣截止，epoch 毫秒）里，二者对同一包取值一致。
+	// 因此本字段改按 CycleEndTime 优先读，旧字段保留作 fallback（已用完的包照旧展示）。
 	EndTime string `json:"end_time,omitempty"`
+	// DeductionEndTime 抵扣截止时刻（RFC3339）。上游与 CycleEndTime 同值但为 epoch 毫秒，
+	// 供前端按需展示；无值时留空。
+	DeductionEndTime string `json:"deduction_end_time,omitempty"`
+	// ExpiresInSec 距到期的剩余秒数（负数 = 已过期；0 = 无到期信息）。
+	// 前端据此排序/染色，避免每个客户端各自解析时间串。
+	ExpiresInSec int64 `json:"expires_in_sec,omitempty"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
 	// TCACA_code_007_*），只看名字无法区分，只有时间能说明它是不是账号首次授权那刻发的。
@@ -1127,6 +1140,10 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
+					// CycleEndTime 周期结束时刻——**有余额的包唯一可用的到期口径**（实测见
+					// CreditPackage.EndTime 注释）。DeductionEndTime 同值但为 epoch 毫秒。
+					CycleEndTime     string `json:"CycleEndTime"`
+					DeductionEndTime int64  `json:"DeductionEndTime"`
 					// 发放时刻（epoch 毫秒）。
 					CreateTime     int64  `json:"CreateTime"`
 					PackageCode    string `json:"PackageCode"`
@@ -1149,10 +1166,15 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		if p.ExpiredTime != "" {
-			cp.EndTime = p.ExpiredTime
-		} else {
-			cp.EndTime = p.PackageEndTime
+		// 到期时间：CycleEndTime 优先（有余额包的真实口径），旧字段作 fallback。
+		// 解析成功同时算出剩余秒数供前端排序/染色；解析不出则三项皆空（不伪造）。
+		if end, ok := packageEndTime(p.CycleEndTime, p.ExpiredTime, p.PackageEndTime); ok {
+			cp.EndTime = end.Format(packageEndLayout)
+			cp.ExpiresInSec = int64(end.Sub(now).Seconds())
+		}
+		// DeductionEndTime 为 epoch 毫秒，与 CycleEndTime 同值；作为交叉校验/展示用。
+		if p.DeductionEndTime > 0 {
+			cp.DeductionEndTime = time.UnixMilli(p.DeductionEndTime).In(softRateResetLoc).Format(packageEndLayout)
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
@@ -1185,18 +1207,59 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 }
 
 func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
-	remain, total, _, err = c.UserResourceDetailed(a, 0)
+	// 零值 buckets（两档都 0）＝ 只查总量，不做任何分桶（与引入前一致）。
+	remain, total, _, _, err = c.UserResourceDetailed(a, ExpiringBuckets{})
 	return remain, total, err
 }
 
 // packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
-// UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
-// soon > 0 且套餐 PackageEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
-// （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
-// 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
-func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+// packageEndTime 解析单个积分包的到期时刻。三个候选字段按可靠性排序，取首个可解析者：
+//
+//  1. CycleEndTime —— **有余额的包唯一可用的到期口径**（实测：27/27、5/5 有余额包仅有它）
+//  2. ExpiredTime  —— 旧口径，实测仅出现在**已用完**的包上
+//  3. PackageEndTime —— 同上，ExpiredTime 缺省时的备选
+//
+// 全部为空/不可解析时返回 ok=false（调用方按"无到期信息"处理，不伪造时间）。
+// 三个字段都是 "2006-01-02 15:04:05" 墙钟格式，固定按 UTC+8 解释。
+func packageEndTime(cycleEnd, expired, pkgEnd string) (time.Time, bool) {
+	for _, s := range []string{cycleEnd, expired, pkgEnd} {
+		if s == "" {
+			continue
+		}
+		if t, err := time.ParseInLocation(packageEndLayout, s, softRateResetLoc); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+// ExpiringBuckets 两个快过期档位的窗口：7 天内（紧急）与 15 天内（次紧急）。
+// 两档**互斥**：≤7 天的积分只计入 7d，不重复计入 15d（否则同一笔积分被加两次权重）。
+// 传 0 表示该档禁用。
+type ExpiringBuckets struct {
+	Within7d  time.Duration
+	Within15d time.Duration
+}
+
+// UserResourceDetailed 在 UserResource 基础上额外返回**两档**快过期积分子集。
+//
+// 分档依据到期紧迫度（见 ExpiringBuckets）：越紧迫越该优先消耗，权重加成越高
+// （pool 侧 expiringWeight7d > expiringWeight15d）。分桶用 packageEndTime 解析出的
+// 到期时刻（CycleEndTime 优先，见该函数注释）。
+//
+// 返回的 expiring7d / expiring15d 是 remain 的一部分，且二者互斥：
+//
+//	expiring7d  = 到期 ≤ now+Within7d 的余额
+//	expiring15d = 到期 ∈ (now+Within7d, now+Within15d] 的余额
+//
+// 任一窗口 ≤0 时对应档恒 0（禁用该档）。两档都禁用时二者均为 0，行为与引入前一致。
+//
+// 历史缺陷（2026-09-16 修复）：旧实现只读 PackageEndTime——而实测该字段在
+// **有余额的包上恒为空**（只有已用完的包才带），于是 expiring 永远算出 0，
+// pool 的 expiringWeight 第四因子（pick.go）从未生效过。现改读 CycleEndTime 优先。
+func (c *Client) UserResourceDetailed(a *auth.Auth, buckets ExpiringBuckets) (remain, total, expiring7d, expiring15d int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1208,7 +1271,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	var resp struct {
 		Response struct {
@@ -1216,6 +1279,8 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 				Accounts []struct {
 					PackageName         string `json:"PackageName"`
 					PackageEndTime      string `json:"PackageEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+					ExpiredTime         string `json:"ExpiredTime"`    // 同上（旧口径，仅已用完的包有值）
+					CycleEndTime        string `json:"CycleEndTime"`   // 同上（**有余额包的真实到期口径**）
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
@@ -1227,7 +1292,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
 		var r, size int64
@@ -1247,16 +1312,23 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 		}
 		remain += r
 		total += size
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
-		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
-				if !end.After(now.Add(soon)) {
-					expiring += r
-				}
-			}
+		// 分桶：能解析出有效到期时间才参与；无到期信息的包一律归"长期"（不计入任一档）。
+		if r <= 0 {
+			continue
+		}
+		end, ok := packageEndTime(acct.CycleEndTime, acct.ExpiredTime, acct.PackageEndTime)
+		if !ok {
+			continue
+		}
+		// 互斥判定：先试 7d 档，命中即止；否则再看 15d 档。
+		switch {
+		case buckets.Within7d > 0 && !end.After(now.Add(buckets.Within7d)):
+			expiring7d += r
+		case buckets.Within15d > 0 && !end.After(now.Add(buckets.Within15d)):
+			expiring15d += r
 		}
 	}
-	return remain, total, expiring, nil
+	return remain, total, expiring7d, expiring15d, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。

@@ -12,8 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
-)
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/prompt"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/upstream"
+) 
 
 // Config 顶层配置。
 type Config struct {
@@ -137,9 +138,14 @@ type Config struct {
 		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
-		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
-		ExpiringSoon string `json:"expiring_soon"`
+		// ExpiringSoon7d / ExpiringSoon15d 两档快过期积分窗口（如 "168h"=7天、"360h"=15天）：
+		// 签到/余额刷新时按到期紧迫度分桶，选号优先消耗更紧迫的那档（7d 档权重高于 15d 档）。
+		// 两档**互斥**（≤7 天的积分不重复计入 15d 档）。空/0 = 禁用该档。
+		ExpiringSoon7d  string `json:"expiring_soon_7d"`
+		ExpiringSoon15d string `json:"expiring_soon_15d"`
+		// ExpiringSoon 旧版单档字段，仅作兼容读取：新配置里 ExpiringSoon7d/15d 都为空时
+		// 用它填充 7d 档（旧口径就是"快过期优先"，语义最接近 7d 档）。不再回写。
+		ExpiringSoon string `json:"expiring_soon,omitempty"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -156,7 +162,8 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
-	ExpiringSoonDur        time.Duration `json:"-"`
+	ExpiringSoon7dDur      time.Duration `json:"-"`
+	ExpiringSoon15dDur     time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -199,7 +206,10 @@ func Default() *Config {
 	c.Pool.BreakerCooldownMax = "6h"
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
-	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// 两档快过期窗口默认 7 天 / 15 天：官方活动奖励积分多在两周内过期，
+	// 7 天档最紧迫（一周内作废），15 天档次之（两周内作废）。
+	c.Pool.ExpiringSoon7d = "168h"  // 7 天
+	c.Pool.ExpiringSoon15d = "360h" // 15 天
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -361,6 +371,15 @@ func applyEnv(c *Config) {
 	}
 }
 
+// ExpiringBuckets 把解析后的两档时长收拢成 upstream 的分桶结构，
+// 供调度器与面板共用（两处口径必须一致，否则"定时任务分桶、面板不分桶"）。
+func (c *Config) ExpiringBuckets() upstream.ExpiringBuckets {
+	return upstream.ExpiringBuckets{
+		Within7d:  c.ExpiringSoon7dDur,
+		Within15d: c.ExpiringSoon15dDur,
+	}
+}
+
 func (c *Config) normalize() error {
 	var err error
 	// max_body_mb 非法（0/负数）直接报错：0 若被静默当成默认 8MB，用户以为"不限"，
@@ -390,12 +409,27 @@ func (c *Config) normalize() error {
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
 	}
-	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
-	if c.Pool.ExpiringSoon != "" {
-		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
-			return fmt.Errorf("pool.expiring_soon: %w", err)
+	// 快过期窗口（两档）：空 = 禁用该档（时长 0）；非空必须可解析（拼写错误 fail fast）。
+	if c.Pool.ExpiringSoon7d != "" {
+		if c.ExpiringSoon7dDur, err = time.ParseDuration(c.Pool.ExpiringSoon7d); err != nil {
+			return fmt.Errorf("pool.expiring_soon_7d: %w", err)
 		}
 	}
+	if c.Pool.ExpiringSoon15d != "" {
+		if c.ExpiringSoon15dDur, err = time.ParseDuration(c.Pool.ExpiringSoon15d); err != nil {
+			return fmt.Errorf("pool.expiring_soon_15d: %w", err)
+		}
+	}
+	// 旧版单档字段兼容：新两档都未配置时，用它填 7d 档（旧口径语义最接近 7d）。
+	// 若旧值解析失败不报错——它是废弃字段，不应让旧配置无法启动；静默忽略并走默认。
+	if c.ExpiringSoon7dDur == 0 && c.ExpiringSoon15dDur == 0 && c.Pool.ExpiringSoon != "" {
+		if d, derr := time.ParseDuration(c.Pool.ExpiringSoon); derr == nil {
+			c.ExpiringSoon7dDur = d
+		}
+	}
+	// 两档都解析出时长但 7d >= 15d：档位失去区分度（7d 档把 15d 档全吃掉）。
+	// 不报错（用户可能有意只用一个窗口），但保证顺序正确由分桶逻辑自然处理——
+	// 分桶是"先判 7d 命中即止"，7d 更大时 15d 档恒空，等价于单档。此处仅作说明。
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}

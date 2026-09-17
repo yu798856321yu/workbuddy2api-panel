@@ -20,12 +20,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/httpauth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/livecfg"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/scheduler"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/upstream"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -60,6 +60,11 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ExpiringBuckets 两档快过期积分窗口（与 scheduler.ExpiringBuckets 同源，
+	// 来自 config.pool.expiring_soon_7d/15d）。面板单号签到/余额刷新按它给积分数分桶，
+	// 供选号优先消耗快到期积分；两档都为 0 时不分桶（与引入前一致）。
+	ExpiringBuckets upstream.ExpiringBuckets
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -152,6 +157,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/default", p.withAuth(p.accountSetDefault))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -175,6 +181,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/recent", p.withAuth(p.recentRequests))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -230,6 +237,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
+		"default_uid":     p.cfg.Pool.DefaultUID(),
 		"accounts":        p.cfg.Pool.List(),
 	})
 }
@@ -237,6 +245,23 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+}
+
+// expiringBuckets 返回生效的两档快过期窗口（未注入时用内置默认 7 天 / 15 天）。
+// 与 cmd/server 的 config 默认值保持一致：config 未显式配置时池侧仍按这两档分桶，
+// 避免"面板刷新出的余额不带分桶、只有定时任务带"的口径裂缝。
+func (p *Panel) expiringBuckets() upstream.ExpiringBuckets {
+	b := p.cfg.ExpiringBuckets
+	if b.Within7d <= 0 && b.Within15d <= 0 {
+		return defaultExpiringBuckets
+	}
+	return b
+}
+
+// defaultExpiringBuckets 两档快过期窗口的内置默认（7 天 / 15 天）。
+var defaultExpiringBuckets = upstream.ExpiringBuckets{
+	Within7d:  168 * time.Hour,
+	Within15d: 360 * time.Hour,
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
@@ -340,6 +365,39 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// accountSetDefault 设置/清除「默认账号」：设置后普通请求优先使用该号。
+// 语义与边界：
+//   - 只影响选号优先级，不改任何账号状态（不复活、不禁用、不清冷却）；
+//   - 默认号冷却/禁用/占满在途名额时，请求**静默回落**普通加权轮换，不会失败；
+//   - 同一时刻只有一个默认号：设置新号自动顶掉旧号（池内单字段）；
+//   - body 的 {"default":false} 或 uid 为空 = 清除（回到纯加权轮换）。
+func (p *Panel) accountSetDefault(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	// 清除操作也走同一路由：面板传 uid="_" 之外的账号时是设置；这里按 body 判断。
+	var body struct {
+		Default *bool `json:"default"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if uid == "" || (body.Default != nil && !*body.Default) {
+		// 清除默认号（uid 为空串由池层接受；面板前端传 default=false 表达取消）。
+		if prev := p.cfg.Pool.DefaultUID(); prev != "" {
+			p.cfg.Pool.SetDefaultUID("")
+			log.Printf("panel: 清除默认账号（原 uid=%s）", prev)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "default_uid": ""})
+		return
+	}
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	changed := p.cfg.Pool.SetDefaultUID(uid)
+	if changed {
+		log.Printf("panel: 设置默认账号 uid=%s", uid)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "default_uid": uid, "changed": changed})
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -357,20 +415,28 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	// 带分桶查余额：顺带刷新两档「快过期积分」，供选号优先消耗（与调度器同口径）。
+	remain, total, exp7d, exp15d, err := p.cfg.Upstream.UserResourceDetailed(a, p.expiringBuckets())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
+	// 顺序有意：先写分桶（credits/creditsTotal/两档 expiring），再走解冻——
+	// reviveCoolingLocked 只写 credits/creditsTotal，不碰分桶，
+	// 因此分桶不会被解冻覆盖。expiring<=0 时也照写（清掉过期的旧分桶）。
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, exp7d, exp15d)
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	resp["credits"] = remain
 	resp["credits_total"] = total
+	resp["credits_expiring_7d"] = exp7d
+	resp["credits_expiring_15d"] = exp15d
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // accountBalance 单号余额刷新：UserResource → SetCredits（不触碰冷却状态）。
+// 顺带刷新「快过期积分」分桶，让面板手动刷新也能修正选号权重（与调度器同口径）。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -378,13 +444,17 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, exp7d, exp15d, err := p.cfg.Upstream.UserResourceDetailed(a, p.expiringBuckets())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain, total)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+	// 同样写分桶（expiring<=0 = 无快过期积分，清旧值）。
+	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, exp7d, exp15d)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "credits": remain, "credits_total": total,
+		"credits_expiring_7d": exp7d, "credits_expiring_15d": exp15d,
+	})
 }
 
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
@@ -474,6 +544,16 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// recentRequests 返回最近若干条请求的结构化记录（最新在前），供面板
+// 「实时请求」表格渲染。纯内存读取，不打上游、不落盘。
+func (p *Panel) recentRequests(w http.ResponseWriter, r *http.Request) {
+	rows := usage.RecentRequests()
+	if rows == nil {
+		rows = []usage.RecentRequest{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"requests": rows})
+}
 
 // usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
 // 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。

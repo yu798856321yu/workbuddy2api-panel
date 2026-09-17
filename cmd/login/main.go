@@ -30,7 +30,7 @@ import (
 	"strings"
 	"time"
 
-	auth2 "github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	auth2 "github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 // 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai

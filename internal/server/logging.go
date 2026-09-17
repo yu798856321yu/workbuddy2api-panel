@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/usage"
 )
 
 // chatSeq 进程级请求序号。
@@ -37,6 +39,9 @@ type chatStat struct {
 	uid    string // 完整 uid，展示时只取前 8 位
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
+	// credits 本次请求上游返回的真实扣费（usage.credit）。<0 表示上游没给该字段
+	// （与"扣了 0"是两回事，见 chatStatsReader.parseSSELine 注释）。
+	credits float64
 	status int
 
 	logged bool
@@ -48,7 +53,7 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, credits: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -57,7 +62,28 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.credits)
+	// 同步进结构化环形缓冲（面板「实时请求」表格用）：与日志行同源，
+	// 但保留字段而非格式化文本，前端无需反向解析。
+	total := time.Since(s.start)
+	rec := usage.RecentRequest{
+		Seq:        chatSeq.Load(),
+		At:         time.Now(),
+		Model:      s.model,
+		Mode:       s.mode,
+		Status:     s.status,
+		UID:        uidPrefix(s.uid),
+		TTFBMs:     s.ttfb.Milliseconds(),
+		Tokens:     s.toks,
+		HasCredits: s.credits >= 0,
+		Credits:    s.credits,
+		TotalMs:    total.Milliseconds(),
+	}
+	// 速率与日志行同口径：completion_tokens / 总耗时；token 缺失时为 0。
+	if s.toks >= 0 && total > 0 {
+		rec.TokensPerSec = float64(s.toks) / total.Seconds()
+	}
+	usage.AddRecent(rec)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -74,6 +100,9 @@ type chatStatsReader struct {
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
+	// credits 末帧 usage.credit（本次真实扣费）；hasCredits 区分"上游没给"与"扣了 0"。
+	credits    float64
+	hasCredits bool
 	pend                []byte // 已读未返回的行缓存
 }
 
@@ -88,9 +117,13 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
 
+// Credits 返回末帧 usage.credit（本次真实扣费）与是否缺失。
+// 上游 2026-09-13 起在末帧 usage 里带 credit；缺失时 ok=false（不伪装成 0）。
+func (s *chatStatsReader) Credits() (float64, bool) { return s.credits, s.hasCredits }
+
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
-	return pool.TokenUsageDelta{
+	d := pool.TokenUsageDelta{
 		HasPromptTokens:     s.hasPromptTokens,
 		PromptTokens:        int64(s.promptTokens),
 		HasCompletionTokens: s.hasCompletionTokens,
@@ -98,6 +131,12 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		HasTotalTokens:      s.hasTotalTokens,
 		TotalTokens:         int64(s.totalTokens),
 	}
+	// 真实扣费随同 usage 一起透出（上游末帧才给；非流式走 usageDeltaFromResponse）。
+	if s.hasCredits {
+		d.HasCredits = true
+		d.Credits = s.credits
+	}
+	return d
 }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
@@ -119,6 +158,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptTokens     *int `json:"prompt_tokens"`
 			CompletionTokens *int `json:"completion_tokens"`
 			TotalTokens      *int `json:"total_tokens"`
+			// Credit 本次真实扣费（上游 2026-09-13 起提供）。用 *float64 区分
+			// "字段缺失"（nil）与"确实扣了 0"（0.0）——后者是真实观测，不该被吞掉。
+			Credit *float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -135,6 +177,11 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.TotalTokens != nil {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
+	}
+	// 扣费只在末帧出现：非负值采信，负值视为异常丢弃（保持 hasCredits=false）。
+	if c := chunk.Usage.Credit; c != nil && *c >= 0 {
+		s.hasCredits = true
+		s.credits = *c
 	}
 }
 
@@ -225,7 +272,38 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	if n, ok := read("total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
+	// 真实扣费（usage.credit）：数值型且非负才采信；缺失/负数一律不设 HasCredits。
+	delta.Credits, delta.HasCredits = readCredit(u["credit"])
 	return delta
+}
+
+// readCredit 从 usage.credit 原始值取本次扣费（浮点，上游给小数）。
+// 只接受非负数值：bool/字符串/负数/缺失都返回 ok=false——「没数据」与「免费」
+// 在成本判断上是两回事（与参考实现 _usage_credit 的口径一致）。
+func readCredit(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		if n >= 0 {
+			return n, true
+		}
+	case float32:
+		if n >= 0 {
+			return float64(n), true
+		}
+	case int:
+		if n >= 0 {
+			return float64(n), true
+		}
+	case int64:
+		if n >= 0 {
+			return float64(n), true
+		}
+	case json.Number:
+		if f, err := n.Float64(); err == nil && f >= 0 {
+			return f, true
+		}
+	}
+	return 0, false
 }
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
@@ -253,8 +331,8 @@ func uidPrefix(uid string) string {
 }
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+// toks<0 表示 usage 缺失，显示 "-"；credits<0 表示上游未返回扣费字段，同样显示 "-"。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, credits float64) {
 	if !chatLogEnabled {
 		return
 	}
@@ -272,11 +350,20 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 			tokpsField = "0.0"
 		}
 	}
+	// 扣费列：整数直出，小数保留 2 位（上游 credit 是浮点，如 0.0004）。
+	credField := "-"
+	if credits >= 0 {
+		if credits == math.Trunc(credits) {
+			credField = fmt.Sprintf("%.0f", credits)
+		} else {
+			credField = fmt.Sprintf("%.2f", credits)
+		}
+	}
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | cr=%s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -286,6 +373,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		ttfbMS,
 		tokField,
 		tokpsField,
+		credField,
 		total.Seconds(),
 	)
 }

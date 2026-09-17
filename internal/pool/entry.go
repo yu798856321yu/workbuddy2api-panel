@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 type CoolKind int
@@ -32,10 +32,17 @@ type TokenUsage struct {
 	PromptTokens        int64     `json:"prompt_tokens,omitempty"`
 	CompletionTokens    int64     `json:"completion_tokens,omitempty"`
 	TotalTokens         int64     `json:"total_tokens,omitempty"`
+	// CreditsUsed 累计真实扣费（usage.credit 求和）。CreditsSamples 为提供了该字段的
+	// 尝试数——上游未返回 credit 的请求不计入，故二者一起才能判断均值是否可信。
+	CreditsUsed         float64   `json:"credits_used,omitempty"`
+	CreditsSamples      int64     `json:"credits_samples,omitempty"`
 	LastLatencyMs       int64     `json:"last_latency_ms,omitempty"`
 	LastTokensPerSecond *float64  `json:"last_tokens_per_second,omitempty"`
 	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
 	LastModel           string    `json:"last_model,omitempty"`
+	// LastCredits 最近一次**上游返回了 credit** 的请求的扣费值（0 是合法观测；
+	// 上游没给时保留上一次值不动）。
+	LastCredits         float64   `json:"last_credits,omitempty"`
 }
 
 // TokenUsageDelta 是一次聊天账号尝试的 usage 增量。
@@ -48,6 +55,10 @@ type TokenUsageDelta struct {
 	CompletionTokens    int64
 	HasTotalTokens      bool
 	TotalTokens         int64
+	// Credits 本次请求上游返回的真实扣费（usage.credit，上游 2026-09-13 起提供）。
+	// HasCredits=false 表示上游没给该字段——与"扣了 0"不同，不累计也不伪造。
+	HasCredits bool
+	Credits    float64
 	HasLatencyMs        bool
 	LatencyMs           int64
 	HasTokensPerSecond  bool
@@ -60,6 +71,13 @@ type Status struct {
 	Nickname      string    `json:"nickname,omitempty"`
 	Credits       int64     `json:"credits"`
 	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsExpiring7d / CreditsExpiring15d 两档**互斥**的快过期积分子集，都是 Credits 的一部分。
+	// 7d = ≤7 天到期（更紧迫，权重更高）；15d = ≤15 天但 >7 天到期。
+	// 选号权重对两档分别加成（见 pick.go expiringWeight7d/15d）。
+	CreditsExpiring7d  int64 `json:"credits_expiring_7d,omitempty"`
+	CreditsExpiring15d int64 `json:"credits_expiring_15d,omitempty"`
+	// Default 该账号是否为「默认账号」：开启后普通请求优先使用它（见 pick 的默认号短路）。
+	Default bool `json:"default,omitempty"`
 	Cooling       bool      `json:"cooling"`
 	CoolKind      string    `json:"cool_kind,omitempty"`
 	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
@@ -113,11 +131,19 @@ type entry struct {
 	a            *auth.Auth
 	credits      int64
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
-	// creditsExpiring 即将过期（签到时按 expiring_soon 窗口判定）的可用积分子集，
-	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
-	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废。
-	// 运行态，签到/余额刷新时更新，不单独持久化（credits 仍持总量）。
-	creditsExpiring int64
+	// creditsExpiring7d / creditsExpiring15d 两个**互斥**档位的快过期积分子集，
+	// 都是 credits 的一部分。分档依据是到期紧迫度，越紧迫权重加成越高：
+	//
+	//	creditsExpiring7d  ≤ 7 天到期   —— 最紧迫，权重 ×expiringWeight7d
+	//	creditsExpiring15d ≤ 15 天到期  —— 次紧迫，权重 ×expiringWeight15d
+	//
+	// **互斥**：7 天内到期的积分只计入 7d 档，不再重复计入 15d 档
+	// （否则同一笔积分被加两次权重，7d 档账号会被双重放大）。
+	// 二者与"长期积分"（credits - 7d - 15d）共同构成 credits。
+	//
+	// 运行态，签到/余额刷新时更新；随 state.json 持久化（重启后不失效到下次签到）。
+	creditsExpiring7d  int64
+	creditsExpiring15d int64
 	successCount    int64      // 累计成功
 	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
 	lastErr         time.Time  // 最近一次错误时间
@@ -262,6 +288,14 @@ func (e *entry) fallbackKind(now time.Time) string {
 type stateAccount struct {
 	Credits      int64     `json:"credits"`
 	CreditsTotal int64     `json:"credits_total,omitempty"`
+	// CreditsExpiring7d / CreditsExpiring15d 两档互斥的快过期可用积分子集，是 credits 的一部分。
+	// 随 credits 一同持久化，保证重启后「快过期优先」不会静默失效到下次签到。
+	// 旧 state.json 无这两字段 → 零值（退化为"无快过期积分"，行为与引入前一致）。
+	CreditsExpiring7d  int64 `json:"credits_expiring_7d,omitempty"`
+	CreditsExpiring15d int64 `json:"credits_expiring_15d,omitempty"`
+	// CreditsExpiring 旧版单档字段（≤expiring_soon 窗口）。仅作一次性迁移源读取：
+	// 加载时并入 15d 档（旧口径默认窗口 7 天，最接近 15d 档语义），不再回写。
+	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
 	Disabled     bool      `json:"disabled"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
@@ -282,6 +316,9 @@ type stateAccount struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// DefaultUID 「默认账号」UID（空 = 未设置）。旧 state.json 无此字段 → 零值，
+	// 行为与引入前一致（纯加权轮换）。
+	DefaultUID string `json:"default_uid,omitempty"`
 }
 
 // flushInterval 后台落盘周期。

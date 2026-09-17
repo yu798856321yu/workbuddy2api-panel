@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
 )
 
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
@@ -48,6 +48,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
 		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
+	}
+	// 默认账号短路：面板设了默认号且它当前可用时直取，跳过加权抽签与防惊群窗口——
+	// 用户显式指定优先于负载均摊，这正是「指定用哪个账号」的语义。
+	if e := p.pickDefaultLocked(tried, reqModel, realm, now); e != nil {
+		return e.a
 	}
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -150,6 +155,39 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
 	return e.a
+}
+
+// pickDefaultLocked 默认账号直取：面板设了默认号、且它当前满足本轮可用条件时返回它。
+//
+// 可用条件（全部满足才直取，任一不满足即返回 nil 走普通轮换）：
+//   - tried 未包含它：本轮已试过（失败/换号中）就不再重复选，避免死循环重试同一号；
+//   - 账号存在且 healthyOf(e)：健康口径与普通选号一致（realm 过滤 + 6004 模型豁免）；
+//   - 在途未满：并发超过 maxInFlight 时溢出到其他号，避免默认号被压垮。
+//
+// 调用方必须已持有 p.mu。返回 nil 表示"不适用默认号"，调用方照常走加权轮换。
+func (p *Pool) pickDefaultLocked(tried map[string]bool, reqModel, realm string, now time.Time) *entry {
+	if p.defaultUID == "" {
+		return nil
+	}
+	if tried != nil && tried[p.defaultUID] {
+		return nil
+	}
+	e, ok := p.byUID[p.defaultUID]
+	if !ok {
+		return nil
+	}
+	realmOK := realm == "" || e.a.Realm() == realm
+	healthy := realmOK && e.healthy(now)
+	if reqModel != "" {
+		healthy = realmOK && e.healthyForModel(now, reqModel)
+	}
+	if !healthy || p.inFlightFull(e) {
+		return nil
+	}
+	e.lastUsed = now
+	p.pickSeq++
+	e.usedSeq = p.pickSeq
+	return e
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
@@ -256,11 +294,20 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 		w += float64(e.credits) / float64(maxCredits) * 10
 	}
 	// 1b. 快过期积分加成：官方活动赠送的奖励积分按批过期，不用就作废。
-	// creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期占比"作为独立的
-	// 强权重项（×expiringWeight），让快过期积分多的号优先选。与 credits 总量项
-	// 正交：那是按总量，这是按过期紧迫度。
-	if e.credits > 0 && e.creditsExpiring > 0 {
-		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
+	// 按"快过期占比"给独立权重项，两档**分别**加成，越紧迫加成越高：
+	//
+	//	≤7 天  ×expiringWeight7d  （最紧迫：一周内不用就作废）
+	//	≤15 天 ×expiringWeight15d （次紧迫：两周内不用就作废）
+	//
+	// 与 credits 总量项正交：那是按总量，这是按过期紧迫度。
+	// 两档互斥（见 SetCreditsDetailed），同一笔积分只会被加一次权重。
+	if e.credits > 0 {
+		if e.creditsExpiring7d > 0 {
+			w += float64(e.creditsExpiring7d) / float64(e.credits) * expiringWeight7d
+		}
+		if e.creditsExpiring15d > 0 {
+			w += float64(e.creditsExpiring15d) / float64(e.credits) * expiringWeight15d
+		}
 	}
 	// 2. 闲置补偿。
 	if e.lastUsed.IsZero() {
@@ -288,7 +335,13 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 
 // SetCredits 更新账号余额。
 
-// expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
-// 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
-// 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
-const expiringWeight = 8.0
+// 快过期积分占比的权重系数（三因子之外的第四因子，分两档）。
+//
+// 取值逻辑：都略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间
+// 拉开差距，又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
+// 7 天档（×9）高于 15 天档（×5），体现"越紧迫越优先"：
+// 7 天档满额时加成 9，接近总量项满额（10）——一周内作废的积分优先级接近"总量最大"。
+const (
+	expiringWeight7d  = 9.0
+	expiringWeight15d = 5.0
+)

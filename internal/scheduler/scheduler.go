@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/pool"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/upstream"
 )
 
 // Config 调度器依赖。
@@ -29,11 +29,10 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
 
-	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
-	// <= now+window 的套餐余额标记为"快过期"（pool 据此优先消耗，见
-	// entry.creditsExpiring）。<=0 时禁用分桶（全部归长期，行为与引入前一致）。
-	// 默认建议 7*24h。
-	ExpiringSoonWindow time.Duration
+	// ExpiringBuckets 两档快过期积分窗口：签到/余额刷新查余额时，按到期紧迫度分桶
+	// （pool 据此优先消耗更紧迫的那档，见 entry.creditsExpiring7d/15d）。
+	// 两档互斥；任一为 0 表示禁用该档。默认 7 天 / 15 天。
+	ExpiringBuckets upstream.ExpiringBuckets
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
@@ -281,16 +280,16 @@ func (s *Scheduler) RunCheckinNow() {
 			}
 			// 其余业务错误也继续走余额查询
 		}
-		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
-		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
-		remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+		// 分桶查余额：两档快过期积分单独标记，pool 优先消耗更紧迫的那档。
+		// 两档窗口都为 0 时退化为纯总量（与引入前一致）。
+		remain, total, exp7d, exp15d, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringBuckets)
 		if err != nil {
 			log.Printf("user-resource %s: %v", st.UID, err)
 			continue
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		if expiring > 0 {
-			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring)
+		if exp7d > 0 || exp15d > 0 {
+			s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, exp7d, exp15d)
 		}
 	}
 	s.RunStreakBonusNow()
@@ -396,13 +395,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
+			remain, total, exp7d, exp15d, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringBuckets)
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
-			if expiring > 0 {
-				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
+			if exp7d > 0 || exp15d > 0 {
+				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, exp7d, exp15d)
 			} else {
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			}

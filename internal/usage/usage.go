@@ -53,6 +53,10 @@ type bucket struct {
 	PT    int64   `json:"p"`  // prompt tokens
 	CT    int64   `json:"c"`  // completion tokens
 	TT    int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
+	// Cred 累计真实扣费（上游 usage.credit）；CredN 为提供了该字段的尝试数。
+	// 上游未返回 credit 的请求不计入，故二者需一起看（均值 = Cred/CredN）。
+	Cred  float64 `json:"cr,omitempty"`
+	CredN int64   `json:"crn,omitempty"`
 	LatMs int64   `json:"l"`  // 延迟累计（ms）
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
@@ -134,6 +138,10 @@ type Delta struct {
 	HasCompletion    bool
 	TotalTokens      int64
 	HasTotal         bool
+	// Credits 本次真实扣费（上游 usage.credit）。HasCredits=false 表示上游没给，
+	// 不参与求和（与"扣了 0"区分）。
+	Credits    float64
+	HasCredits bool
 	LatencyMs        int64
 	HasLatency       bool
 	TokensPerSecond  float64
@@ -180,6 +188,10 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	} else if d.HasPromptTokens || d.HasCompletion {
 		// 上游没给 total：用 pt+ct 兜底，保证总量口径连续。
 		b.TT += d.PromptTokens + d.CompletionTokens
+	}
+	if d.HasCredits {
+		b.Cred += d.Credits
+		b.CredN++
 	}
 	if d.HasLatency {
 		b.LatMs += d.LatencyMs
@@ -233,6 +245,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.PT += src.PT
 			dst.CT += src.CT
 			dst.TT += src.TT
+			dst.Cred += src.Cred
+			dst.CredN += src.CredN
 			dst.LatMs += src.LatMs
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
@@ -315,6 +329,9 @@ type Agg struct {
 	PromptTokens  int64   `json:"prompt_tokens"`
 	CompletionTok int64   `json:"completion_tokens"`
 	TotalTokens   int64   `json:"total_tokens"`
+	// Credits 累计真实扣费；CreditSamples 为提供该字段的请求数（均值 = Credits/CreditSamples）。
+	Credits       float64 `json:"credits"`
+	CreditSamples int64   `json:"credit_samples"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
 }
@@ -335,6 +352,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.PromptTokens += b.PT
 	g.CompletionTok += b.CT
 	g.TotalTokens += b.TT
+	g.Credits += b.Cred
+	g.CreditSamples += b.CredN
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
