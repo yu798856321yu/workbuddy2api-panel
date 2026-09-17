@@ -167,6 +167,8 @@ input, select {
   border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
 }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
+input.invalid { border-color: var(--bad); background: var(--bad-soft); }
+input.invalid:focus { border-color: var(--bad); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
 label.fld { display: block; margin-bottom: 14px; }
 label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
@@ -763,24 +765,38 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">单账号最大在途</span>
                 <input name="max_in_flight" type="number" min="0" placeholder="3">
                 <span class="hint">0 = 不限制</span></label>
+              <label class="fld"><span class="lb">国际版在途上限</span>
+                <input name="max_in_flight_global" type="number" min="1" placeholder="2">
+                <span class="hint">global 域风控更紧，默认 2</span></label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
-              <label class="fld"><span class="lb">软限流冷却基数</span>
-                <input name="soft_rate" placeholder="600s"></label>
             </div>
             <div class="grid3">
+              <label class="fld"><span class="lb">软限流冷却基数</span>
+                <input name="soft_rate" placeholder="600s"></label>
               <label class="fld"><span class="lb">软冷却退避上限</span>
                 <input name="soft_rate_max" placeholder="2h"></label>
               <label class="fld"><span class="lb">熔断基础时长</span>
                 <input name="breaker_cooldown" placeholder="30m"></label>
-              <label class="fld"><span class="lb">熔断退避上限</span>
-                <input name="breaker_cooldown_max" placeholder="6h"></label>
             </div>
             <div class="grid3">
+              <label class="fld"><span class="lb">熔断退避上限</span>
+                <input name="breaker_cooldown_max" placeholder="6h"></label>
+              <label class="fld"><span class="lb">连败降权阈值</span>
+                <input name="degrade_threshold" type="number" min="1" placeholder="5">
+                <span class="hint">未知错误连败 N 次临时出池</span></label>
+              <label class="fld"><span class="lb">连败降权时长</span>
+                <input name="degrade_cooldown" placeholder="10m"></label>
+            </div>
+            <div class="grid3">
+              <label class="fld"><span class="lb">连败降权上限</span>
+                <input name="degrade_cooldown_max" placeholder="2h"></label>
               <label class="fld"><span class="lb">闲置补偿 / 小时</span>
                 <input name="idle_weight_per_hour" type="number" step="0.1" placeholder="0.5"></label>
               <label class="fld"><span class="lb">闲置补偿上限</span>
                 <input name="idle_weight_max" type="number" step="0.1" placeholder="5"></label>
+            </div>
+            <div class="grid3">
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
@@ -903,7 +919,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg">
     <header>
       <h3>开学季 · 我的券码</h3>
-      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店出示核销。</div>
+      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
     </header>
     <div class="body" id="vcBody"></div>
     <footer>

@@ -3,6 +3,8 @@
 package upstream
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strings"
 
@@ -113,6 +115,34 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
+// deriveAccountStableID 按 uid + 用途盐稳定派生 36 hex 设备/会话标识。
+// 跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包派生盐的本质差异：
+// 那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，必须跨重启恒定）、
+// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。用 sha256 与项目
+// 既有派生（session/ids.go、cache_key.go）保持一致；截 36 hex 提供更长熵。
+//
+// 两个用途：
+//   - purpose="machine" → X-Machine-ID（设备级，跨会话稳定）
+//   - purpose="session" → X-Session-ID（账号固定会话，跨重启稳定）
+//
+// 与 injectDeviceToken 的 X-Device-Token 并存不冲突：那是登录时上游签发的
+// 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹，
+// 防多号被上游按设备指纹缺失/漂移关联风控。两者是不同头族，官方桌面端都发。
+func deriveAccountStableID(uid, purpose string) string {
+	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
+	return hex.EncodeToString(sum[:18]) // 36 hex chars
+}
+
+// injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
+// 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
+func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || a.UID == "" {
+		return
+	}
+	req.Header.Set("X-Machine-ID", deriveAccountStableID(a.UID, "machine"))
+	req.Header.Set("X-Session-ID", deriveAccountStableID(a.UID, "session"))
+}
+
 // CommonHeaders 设置所有 API 共享的请求头。
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
@@ -129,6 +159,10 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
+	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
+	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
+	c.injectAccountStableHeaders(req, a)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。

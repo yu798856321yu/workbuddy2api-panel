@@ -483,7 +483,9 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 }
 
 // TestModelCooldownsNotPersisted modelCooldowns 运行态、不持久化（重启清零）。
-func TestModelCooldownsNotPersisted(t *testing.T) {
+func TestModelCooldownsPersist(t *testing.T) {
+	// 6004 重置墙钟可长达数小时，跨重启是常态：model_cooldowns 持久化，
+	// 恢复后 healthyForModel 不失忆（吸收上游 2f4c77b）。
 	dir := t.TempDir()
 	fp := dir + "/state.json"
 	p := New(fp)
@@ -494,16 +496,16 @@ func TestModelCooldownsNotPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "model_cooldowns") || strings.Contains(string(raw), "modelCooldowns") {
-		t.Errorf("state.json 不应持久化 modelCooldowns:\n%s", raw)
+	if !strings.Contains(string(raw), "model_cooldowns") {
+		t.Errorf("state.json 应持久化 model_cooldowns: %s", raw)
 	}
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	p2.mu.RLock()
 	n := len(p2.byUID["u1"].modelCooldowns)
 	p2.mu.RUnlock()
-	if n != 0 {
-		t.Errorf("重载后 modelCooldowns=%d want 0（重启清零）", n)
+	if n != 1 {
+		t.Errorf("重载后 modelCooldowns=%d want 1（持久化恢复）", n)
 	}
 }
 

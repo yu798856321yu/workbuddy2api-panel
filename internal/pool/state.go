@@ -3,10 +3,12 @@
 package pool
 
 import (
+	"log"
 	"sort"
 	"time"
 
 	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/logfmt"
 )
 
 func (p *Pool) Disable(uid, reason string) {
@@ -128,10 +130,12 @@ func (p *Pool) NoteError(uid string) {
 // NoteSuccess 成功请求累加成功计数、刷新 lastSuccess，并清空连续失败与熔断运行态。
 // 二进制模型：清 fails + retryCount + breakerUntil；不碰 until/coolKind（那些是即时冷却，各自到期）。
 // 额外清 softStreak：成功是账号已恢复的最强证据，连续软限流计数就此归零、退避回到基数。
-// 同样清 sessionDeadFails：成功证明 session 未死（与 ClearSessionDead 语义一致）。
+// 同样清 sessionDeadFails 与连败降权计数（consecutiveFails/degradeUntil，issue #114）：
+// 成功证明账号当前可用，连败计数与临时出池截止一并归零。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
-// 冷却（Cooldown/reviveCoolingLocked）清除。
+// 冷却（Cooldown/reviveCoolingLocked）清除。11102 条目的成功清理由 handler 在
+// 成功且模型命中时显式调 BlockModelClear（6004 不清，语义不同）。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -143,8 +147,84 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.breakerUntil = time.Time{}
 		e.softStreak = 0
 		e.sessionDeadFails = 0
+		e.consecutiveFails = 0
+		e.degradeUntil = time.Time{}
 		p.dirty.Store(true)
 	}
+}
+
+// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本，并顺带
+// 扣减账号余额（credits/creditsExpiring）。credit 为上游 usage.credit（本次真实
+// 扣费=消耗量），tokens 为本次请求的 token 总数（prompt+completion，用于折算单位
+// 成本）。tokens<=0 时不记录：无法折算单价，记进去会污染账本。
+//
+// 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
+// 账本持久化到 state.json（stateAccount.ModelCosts）：重启后成本知识保留，
+// 限免/夜间免费的跨重启窗口不再重新付学费探测；落盘/恢复均按 modelCostTTL
+// 惰性过滤——陈旧价格（时段性优惠）不跨 TTL 复活。
+// 限免结束事件：tier 0 观测（per1k≤0）被 credit>0 观测覆盖时打一条明确日志
+// （运维据此知道"免费午餐结束了"），判定在写入口做、只看覆盖前值。
+//
+// credits 签到外回写：credit 是本次请求的**消耗量**，不是剩余余额。顺手扣减
+// credits 与 creditsExpiring，让选号余额因子随消耗实时收敛——旧口径只在签到
+// （每天 09:00/21:00 两次）刷新，两次签到之间（最长 12h）高消耗号持续高权重直到
+// 打空撞 402；global 账号不签到，credits 曾是终身冻结。签到仍定期覆盖
+// （ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额重置），扣减只是
+// 两次签到之间的内插估计；credit=0（免费请求）不动余额。
+func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
+	if uid == "" || model == "" || tokens <= 0 {
+		return
+	}
+	// 单价按每千 token 归一，消除请求长度差异。
+	per1k := credit / float64(tokens) * 1000
+	if per1k < 0 {
+		per1k = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if credit > 0 {
+		d := int64(credit + 0.5) // 四舍五入
+		if d > e.credits {
+			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
+		}
+		e.credits -= d
+		rem := d
+		if e.creditsExpiring7d > 0 {
+			sub := rem
+			if sub > e.creditsExpiring7d { sub = e.creditsExpiring7d }
+			e.creditsExpiring7d -= sub
+			rem -= sub
+		}
+		if rem > 0 && e.creditsExpiring15d > 0 {
+			sub := rem
+			if sub > e.creditsExpiring15d { sub = e.creditsExpiring15d }
+			e.creditsExpiring15d -= sub
+		}
+	}
+	if e.modelCost == nil {
+		e.modelCost = make(map[string]modelCostEntry)
+	}
+	const alpha = 0.3
+	prev, seen := e.modelCost[model]
+	if !seen {
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+	} else {
+		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
+		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
+		if prev.CostPer1k <= 0 && per1k > 0 {
+			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+		}
+		e.modelCost[model] = modelCostEntry{
+			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
+			LastSeen:  time.Now(),
+			Samples:   prev.Samples + 1,
+		}
+	}
+	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
 }
 
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
@@ -177,13 +257,6 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	}
 	if known {
 		usage.UsageCount++
-	}
-	// 真实扣费：只在上游确实返回时累计（HasCredits=false 不碰，避免把"没数据"
-	// 混进均值）。LastCredits 仅在有值时更新，缺失时保留上一次观测。
-	if delta.HasCredits && delta.Credits >= 0 {
-		usage.CreditsUsed += delta.Credits
-		usage.CreditsSamples++
-		usage.LastCredits = delta.Credits
 	}
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		usage.LastLatencyMs = delta.LatencyMs
@@ -415,6 +488,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastErrTime:       e.lastErr,
 		Until:             e.until,
 		SoftStreak:        e.softStreak,
+		ModelCosts:        p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:  e.consecutiveFails,
+		DegradeUntil:      e.degradeUntil,
 		InFlight:          int(e.inFlight.Load()),
 		BreakerFails:      e.fails,
 		BreakerUntil:      e.breakerUntil,
@@ -432,6 +508,37 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.CoolKind = e.coolKind.String()
 	}
 	return st
+}
+
+// modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
+// 仅 modelCostTTL 内的观测进台账（过期/零值跳过，与选号读取侧同口径）；
+// 模型名稳定排序。调用方必须已持有锁。
+func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus {
+	if len(e.modelCost) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(e.modelCost))
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			continue // 过期/零值：不进台账（与选号读取侧同口径）
+		}
+		models = append(models, m)
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	sort.Strings(models)
+	rows := make([]ModelCostStatus, 0, len(models))
+	for _, m := range models {
+		mc := e.modelCost[m]
+		rows = append(rows, ModelCostStatus{
+			Model:     m,
+			CostPer1k: mc.CostPer1k,
+			LastSeen:  mc.LastSeen,
+			Samples:   mc.Samples,
+		})
+	}
+	return rows
 }
 
 // ---------------------------------------------------------------------------

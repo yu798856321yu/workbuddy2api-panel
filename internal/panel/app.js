@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
@@ -160,12 +160,14 @@ function renderAccounts(list) {
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0);
+    const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
+    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > (s.cool_remaining_sec || 0) ? '熔断' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
+      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
+        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
@@ -174,7 +176,14 @@ function renderAccounts(list) {
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
       : Math.round((s.credits || 0) / maxCred * 100);
-    const credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
+    // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
+    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    const costs = (s.model_costs || []).filter(c => c.model);
+    if (costs.length) {
+      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
+        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+    }
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
@@ -209,7 +218,7 @@ function renderAccounts(list) {
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
-      '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + expCell + '</td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -361,7 +370,15 @@ async function loadModels() {
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
       const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
         : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div></td>' +
+      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+      const caps = [];
+      if (m.is_default) caps.push('<span class="tag ok">默认</span>');
+      if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
+      if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+      const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+      const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
+      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
         '<td class="num">' + (m.credits ? esc(m.credits) : '—') + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
@@ -421,7 +438,10 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   max_body_mb: ['server', 'max_body_mb'],
-  max_in_flight: ['pool', 'max_in_flight'], breaker_threshold: ['pool', 'breaker_threshold'],
+  max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
+  breaker_threshold: ['pool', 'breaker_threshold'],
+  degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
+  degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
@@ -454,6 +474,7 @@ async function loadConfig() {
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? '' : v;
     }
+    markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
@@ -475,6 +496,32 @@ function collectConfig() {
   }
   return out;
 }
+/* Go 时长字段即时校验：空 = 沿用现值（collectConfig 跳过发送）；非空必须是
+   ParseDuration 语法（30m / 2h / 600s / 1h30m，可组合可带小数）。与后端
+   config.go normalize() 的 time.ParseDuration 同口径，脏值在前端就地标红，
+   不再等到保存被拒。 */
+const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
+const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
+  'degrade_cooldown', 'degrade_cooldown_max', 'ttl'];
+const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
+function durationBad(name) {
+  const el = $('cfgForm').elements[name];
+  if (!el) return false;
+  const v = el.value.trim();
+  return v !== '' && !DURATION_RE.test(v);
+}
+function markDurationFields() {
+  for (const name of DURATION_FIELDS) {
+    const el = $('cfgForm').elements[name];
+    if (!el) continue;
+    const bad = durationBad(name);
+    el.classList.toggle('invalid', bad);
+    el.title = bad ? DURATION_TIP : '';
+  }
+}
+$('cfgForm').addEventListener('input', ev => {
+  if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
+});
 $('btnEye').onclick = () => {
   const el = $('cfgKey');
   const show = el.type === 'password';
@@ -484,6 +531,15 @@ $('btnEye').onclick = () => {
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
+  // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
+  markDurationFields();
+  const firstBad = DURATION_FIELDS.find(durationBad);
+  if (firstBad) {
+    const el = $('cfgForm').elements[firstBad];
+    el.focus();
+    toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
+    return;
+  }
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
   try {

@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
-	"sync"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -57,13 +56,15 @@ func NewMessageID() string {
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
 }
 
-// requestIDs 会话键（sticky key）→ conversationRequestID 的进程内惰性缓存。
-// sync.Map：并发无锁读/写，Entry 不删除（会话 key 恒定，值只增不减，不泄漏——
-// key 与粘性会话键同源，进程生命周期内数量有限）。
-var requestIDs sync.Map
+// deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
+// 按外部可控的键内容（会话键/轮级键）被预计算；重启换新（重启时旧对话轮/会话已
+// 结束，不构成断档）。会话级（RequestIDForKey）与轮级（TurnRequestID）共用同一盐。
+var deriveSalt = NewMessageID()
 
-// RequestIDForKey 返回会话键的稳定 conversationRequestID：
-//   - 同 key：首次调用生成并缓存，此后恒返回同值（一次 user send/同会话多轮聚合）；
+// RequestIDForKey 返回会话键的稳定 conversationRequestID：sha256(盐|键) 前 16 字节
+// 的 hex，纯派生（无缓存、无 TTL、内存不随键数增长——此前 sync.Map 惰性缓存随
+// 会话键数量无上限增长，纯派生天然有界）。
+//   - 同 key：进程内恒派生同值（一次 user send/同会话多轮聚合）；
 //   - 异 key：各自独立，互不相同；
 //   - 空 key：每次生成新值（无会话则无"会话内稳定"语义——调用方应在请求级
 //     捕获复用，handler 在轮转循环外取一次即天然共享）。
@@ -73,17 +74,9 @@ func RequestIDForKey(key string) string {
 	if key == "" {
 		return NewMessageID()
 	}
-	if v, ok := requestIDs.Load(key); ok {
-		return v.(string)
-	}
-	id := NewMessageID()
-	actual, _ := requestIDs.LoadOrStore(key, id)
-	return actual.(string)
+	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
+	return hex.EncodeToString(sum[:16])
 }
-
-// turnSalt 轮级聚合键的派生盐：进程启动时随机生成，让派生 ID 无法按消息内容
-// 被外部预计算；重启换新（重启时旧对话轮已结束，不构成断档）。
-var turnSalt = NewMessageID()
 
 // TurnKey 派生「对话轮级」聚合键：body 里**最后一条** role=="user" 消息的
 // 「序号 + 文本」。
@@ -171,6 +164,6 @@ func TurnRequestID(turnKey string) string {
 	if turnKey == "" {
 		return NewMessageID()
 	}
-	sum := sha256.Sum256([]byte(turnSalt + "|" + turnKey))
+	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
 	return hex.EncodeToString(sum[:16])
 }

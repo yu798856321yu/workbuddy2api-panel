@@ -75,21 +75,53 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
+	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
+	// 抽签权重共享同一基准，两个阶段权重可比。
 	var maxCredits int64
 	for _, e := range cands {
 		if e.credits > maxCredits {
 			maxCredits = e.credits
 		}
 	}
+	// 成本分层（reqModel 非空时）：按该模型的实测扣费把候选分层，只保留最优层。
+	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
+	//   1 = 无观测（含观测过期）
+	//   2 = 已实测收费
+	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
+	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
+	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
+	// 收费号仍有机会抽中，达不到"优先免费"的语义。
+	costTier := func(e *entry) (int, float64) {
+		mc, ok := e.modelCostOf(reqModel, now)
+		if !ok {
+			return 1, 0
+		}
+		if mc.CostPer1k <= 0 {
+			return 0, 0
+		}
+		return 2, mc.CostPer1k
+	}
+	bestTier := 2
+	for _, e := range cands {
+		if ti, _ := costTier(e); ti < bestTier {
+			bestTier = ti
+		}
+	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
 	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
+	// costTier/modelCostOf 同样每候选只算一次（存入 tier/cost1k），比较器只读缓存字段。
 	type weighted struct {
-		e *entry
-		w float64
+		e      *entry
+		w      float64
+		tier   int
+		cost1k float64
 	}
-	ws := make([]weighted, len(cands))
-	for i, e := range cands {
-		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
+	ws := make([]weighted, 0, len(cands))
+	for _, e := range cands {
+		ti, ci := costTier(e)
+		if ti == bestTier {
+			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+		}
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
@@ -111,6 +143,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 	}
 	sort.SliceStable(ws, func(i, j int) bool {
+		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
+		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
+		if ws[i].cost1k != ws[j].cost1k {
+			return ws[i].cost1k < ws[j].cost1k // 收费层：单价低的在前
+		}
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
@@ -228,13 +265,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	return best.a
 }
 
-// inFlightFull 报告账号是否已占满在途名额（max=0 不限 → 恒 false）。
-// 调用方需已持 p.mu（读锁或写锁均可，本方法只读 p.maxInFlight）。
+// inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；
+// limit=0 不限 → 恒 false）。调用方需已持 p.mu（读锁或写锁均可，本方法只读上限）。
 func (p *Pool) inFlightFull(e *entry) bool {
-	if p.maxInFlight <= 0 {
+	limit := p.inFlightLimit(e)
+	if limit <= 0 {
 		return false
 	}
-	return e.inFlight.Load() >= int64(p.maxInFlight)
+	return e.inFlight.Load() >= int64(limit)
 }
 
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
@@ -323,13 +361,9 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 		}
 		w += idleW
 	}
-	// 3. 成功率 ×3。
-	totalReq := e.successCount + e.errTotal
-	if totalReq > 0 {
-		w += float64(e.successCount) / float64(totalReq) * 3
-	} else {
-		w += 1.5 // 无请求记录 → 中性偏信任
-	}
+	// 3.（原「成功率 ×3」因子已删，对齐上游 success-ema-review：errTotal 是终身
+	// 累计、只增不减，成功率 = successCount/(successCount+errTotal) 会让早期出过错
+	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
 	return w
 }
 

@@ -1,4 +1,4 @@
-// logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
+﻿// logging.go 请求级表格日志：每个 /v1/chat/completions 请求结束后打印一行到 stdout。
 package server
 
 import (
@@ -120,6 +120,12 @@ func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.ha
 // Credits 返回末帧 usage.credit（本次真实扣费）与是否缺失。
 // 上游 2026-09-13 起在末帧 usage 里带 credit；缺失时 ok=false（不伪装成 0）。
 func (s *chatStatsReader) Credits() (float64, bool) { return s.credits, s.hasCredits }
+
+// Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credits, s.hasCredits }
+
+// TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
+func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
 
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {

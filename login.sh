@@ -75,19 +75,30 @@ fi
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
 # ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
-python3 - <<PYEOF
-import json, urllib.request, urllib.error
+# OAuth 返回字段一律通过环境变量传入 Python，并用带引号 heredoc：
+# 昵称/domain/token 等值可含引号或换行，拼进 Python 源码会造成注入。
+WB2A_LOGIN_TOKEN="$TOKEN" \
+WB2A_LOGIN_USER_ID="$USER_ID" \
+WB2A_LOGIN_ENT_ID="$ENT_ID" \
+WB2A_LOGIN_DOMAIN="$DOMAIN" \
+python3 - <<'PYEOF'
+import json, os, urllib.request, urllib.error
+
+token = os.environ["WB2A_LOGIN_TOKEN"]
+user_id = os.environ["WB2A_LOGIN_USER_ID"]
+ent_id = os.environ["WB2A_LOGIN_ENT_ID"]
+domain = os.environ["WB2A_LOGIN_DOMAIN"]
 
 req = urllib.request.Request(
     "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
     method="POST", data=b"{}",
     headers={
-        "Authorization": "Bearer $TOKEN",
+        "Authorization": "Bearer " + token,
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-User-Id": "$USER_ID",
-        **({"X-Enterprise-Id": "$ENT_ID", "X-Tenant-Id": "$ENT_ID"} if "$ENT_ID" else {}),
-        **({"X-Domain": "$DOMAIN"} if "$DOMAIN" else {}),
+        "X-User-Id": user_id,
+        **({"X-Enterprise-Id": ent_id, "X-Tenant-Id": ent_id} if ent_id else {}),
+        **({"X-Domain": domain} if domain else {}),
     })
 try:
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -117,25 +128,34 @@ else
     echo "新账号（uid=${USER_ID}），新增 auth 文件"
     ACTION="新增"
 fi
-python3 - <<PYEOF
-import json
+WB2A_LOGIN_TOKEN="$TOKEN" \
+WB2A_LOGIN_REFRESH="$REFRESH" \
+WB2A_LOGIN_EXPIRES_AT="$EXPIRES_AT" \
+WB2A_LOGIN_DOMAIN="$DOMAIN" \
+WB2A_LOGIN_USER_ID="$USER_ID" \
+WB2A_LOGIN_ENT_ID="$ENT_ID" \
+WB2A_LOGIN_NICKNAME="$NICKNAME" \
+WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
+WB2A_LOGIN_ACTION="$ACTION" \
+python3 - <<'PYEOF'
+import json, os
 
 auth = {
     "account": {
-        "uid": "$USER_ID",
-        "enterpriseId": "$ENT_ID",
-        "nickname": "$NICKNAME"
+        "uid": os.environ["WB2A_LOGIN_USER_ID"],
+        "enterpriseId": os.environ["WB2A_LOGIN_ENT_ID"],
+        "nickname": os.environ["WB2A_LOGIN_NICKNAME"],
     },
     "auth": {
-        "accessToken": "$TOKEN",
-        "refreshToken": "$REFRESH",
-        "expiresAt": $EXPIRES_AT,
-        "domain": "$DOMAIN"
-    }
+        "accessToken": os.environ["WB2A_LOGIN_TOKEN"],
+        "refreshToken": os.environ["WB2A_LOGIN_REFRESH"],
+        "expiresAt": int(os.environ["WB2A_LOGIN_EXPIRES_AT"]),
+        "domain": os.environ["WB2A_LOGIN_DOMAIN"],
+    },
 }
-with open("$AUTH_FILE", "w") as f:
+with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
     json.dump(auth, f, indent=1)
-print(f"已保存（${ACTION}）: $AUTH_FILE")
+print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
 PYEOF
 
 # ─── 重启服务 ────────────────────────────────────────────

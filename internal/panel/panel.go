@@ -280,19 +280,42 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":                   mi.ID,
 			"name":                 mi.Name,
-			"context_length":       mi.ContextWindow,
-			"max_output_tokens":    mi.MaxTokens,
-			"max_allowed_size":     mi.MaxAllowedSize,
 			"default_effort":       mi.DefaultEffort,
 			"supported_efforts":    mi.Efforts,
 			"can_disable_thinking": mi.CanDisableThinking,
 			"supports_reasoning":   mi.SupportsReasoning,
 			"supports_images":      mi.SupportsImages,
 			"credits":              mi.Credits,
-		})
+			"description":          mi.Description,
+			"tags":                 mi.Tags,
+			"vendor":               mi.Vendor,
+			"is_default":           mi.IsDefault,
+			"supports_tool_call":   mi.SupportsToolCall,
+			"only_reasoning":       mi.OnlyReasoning,
+			"reasoning_effort":     mi.ReasoningEffort,
+			"reasoning_summary":    mi.ReasoningSummary,
+		}
+		if mi.MaxAllowedSize > 0 {
+			entry["max_allowed_size"] = mi.MaxAllowedSize
+		}
+		// 与 /v1/models 同口径：context_length / max_output_tokens 走四级查找链
+		// （上游动态值 → 静态知识表 → model.json → models.dev → 1M 兜底），
+		// effort 档位走 EffortListing（远端权威 ∪ CN 静态兜底表）——面板展示的
+		// 数值即客户端实际拿到的数值，两侧不再漂移。
+		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, p.cfg.Upstream.HTTP)
+		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
+			entry["max_output_tokens"] = mo
+		}
+		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["supported_efforts"] = efforts
+			if def != "" {
+				entry["default_effort"] = def
+			}
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }

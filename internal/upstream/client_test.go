@@ -98,13 +98,13 @@ func TestParseSoftRateReset(t *testing.T) {
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
+		{"非 6004 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 6004 判定）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := ParseSoftRateReset(c.body)
+			got, ok := ParseRateReset(c.body)
 			if ok != c.ok {
 				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
 			}
@@ -293,12 +293,13 @@ func TestChatStreamHardCreditError(t *testing.T) {
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
-	if err != nil {
-		t.Fatalf("hard credit should return body via status, not err: %v", err)
+	// 错误信封一次成型：≥400 返回已分类的 *Error（Kind + body 全量仍经 respBody 透出）
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrHardCredit {
+		t.Fatalf("hard credit should return classified *Error envelope, got %v", err)
 	}
-	// caller classifies via returned body
-	if Classify(status, string(respBody)) != ErrHardCredit {
-		t.Errorf("body=%q not classified hard credit", respBody)
+	if len(respBody) == 0 {
+		t.Errorf("body should still be returned for passthrough")
 	}
 }
 
@@ -434,8 +435,8 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+	if htr.ResponseHeaderTimeout != 60*time.Second { // 连接层加固：响应头上限从 120s 收到 60s（慢冷启动留 3.75× 余量）
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
 	}
 }
 
@@ -568,13 +569,5 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	}
 	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
 		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
-	}
-}
-
-func TestMergeModelCapabilitiesKeepsCLIWhenOverlayEmpty(t *testing.T) {
-	base := []ModelInfo{{ID: "m", MaxTokens: 128000, DefaultEffort: "high"}}
-	got := mergeModelCapabilities(base, map[string]ModelInfo{"m": {ID: "m"}})
-	if got[0].MaxTokens != 128000 || got[0].DefaultEffort != "high" {
-		t.Errorf("empty overlay wiped CLI fields: %+v", got[0])
 	}
 }

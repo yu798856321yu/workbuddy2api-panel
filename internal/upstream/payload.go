@@ -35,6 +35,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	obj["stream"] = true
+	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
+	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
+	// DeepSeek Harness 等新客户端只发别名。WorkBuddy 上游（CN /v2 与 global
+	// /console 同源）只认 max_tokens——别名透传会被上游忽略后回落默认输出上限
+	// （实测 32000），长流任务被截。
+	translateMaxCompletionTokens(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -42,6 +48,19 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
+	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
+	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
+	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
+	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
+	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
+	if msgs, ok := obj["messages"].([]any); ok {
+		msgs, _ = repackToolResultBlocks(msgs)
+		msgs, _ = cleanupOrphanToolCalls(msgs)
+		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
+		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
+		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
+		obj["messages"] = msgs
+	}
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
@@ -61,6 +80,39 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	return out
+}
+
+// translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
+// 认的 max_tokens（吸收上游 PR #116）。规则：显式 max_tokens 优先（别名只删）；
+// 别名非正数值（0/null/负数）不翻译（0/null 语义是「未设置」，负数是非法值，
+// 翻译等于把垃圾搬进 max_tokens）；非数值别名（字符串等畸形）不翻译（原样
+// 透传由上游报 11101 参数错）。两域同口径：CN /v2 与 global /console 是同一套
+// API，翻译不分 realm。
+func translateMaxCompletionTokens(obj map[string]any) {
+	alias, has := obj["max_completion_tokens"]
+	delete(obj, "max_completion_tokens") // 无论翻译与否，别名一律删（减少 body 体积与排障噪音）
+	if !has {
+		return
+	}
+	if _, explicit := obj["max_tokens"]; explicit {
+		return // 显式 max_tokens 优先：别名只删不译
+	}
+	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数
+	// 尾巴进上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
+	switch v := alias.(type) {
+	case float64:
+		if v > 0 && v == float64(int64(v)) {
+			obj["max_tokens"] = int64(v)
+		}
+	case int64:
+		if v > 0 {
+			obj["max_tokens"] = v
+		}
+	case int:
+		if v > 0 {
+			obj["max_tokens"] = int64(v)
+		}
+	}
 }
 
 // effortRank 档位从低到高。

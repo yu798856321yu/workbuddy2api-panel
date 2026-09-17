@@ -457,65 +457,53 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	}
 }
 
-// TestApplyErrorPolicySoftRateExponentialBackoff handler 层回归：同一账号连续被限流，
-// 冷却时长必须 600s → 1200s → 2400s 指数增长（时长断言全部取自注入值，不依赖真实等待）。
-// 直接驱动 applyErrorPolicy 而非发 HTTP 请求：账号在冷却期内不会被再次选中，
-// 走完整请求会需要等冷却自然到期（真实 sleep），而这里要验的正是"连续限流"的退避本身。
-// Classify→applyErrorPolicy 的接线由 TestChatSoftCoolsOnRateLimitBody 端到端覆盖。
 func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
+	// 吸收上游语义：带解析重置时间的 body 对齐墙钟；无时间文案走有界退避，且
+	// **冷却中的重复触发不堆加**（旧「每次都翻倍」正是全池被推到 2h 封顶的元凶）。
+	// 跨冷却期的堆加语义由 pool 包 CooldownSoftRate 测试覆盖；此处锚定 handler 侧
+	// 的调用形态：连续 3 次软限流错误 → 首次 600s，后续不延长。
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
-	for i, want := range []int64{600, 1200, 2400} {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "")
+	for i := 1; i <= 3; i++ {
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i+1, st)
+			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i, st)
 		}
-		if st.SoftStreak != i+1 {
-			t.Errorf("call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
+		if st.SoftStreak != 1 {
+			t.Errorf("call %d: 冷却中兜底探测不应推进 soft_streak, got %d", i, st.SoftStreak)
 		}
-		if st.CoolRemaining < want-3 || st.CoolRemaining > want {
-			t.Errorf("call %d: cool_remaining_sec=%d want ~%d", i+1, st.CoolRemaining, want)
+		if st.CoolRemaining < 600-3 || st.CoolRemaining > 600 {
+			t.Errorf("call %d: cool_remaining_sec=%d want ~600（不堆加）", i, st.CoolRemaining)
 		}
 	}
 }
 
-// TestApplyErrorPolicyNotFoundUsesFixedBase 404 分流：偶发上游 404 的冷却基数固定 60s
-// （notFoundCooldown），不取 soft_rate 的 600s 基数，也不受其配置值影响。
-//
-// 关于退避：404 仍走 Cooldown(CoolSoft)，因此与 429 共用同一 softStreak（本用例锚定这一
-// 现状）。这不构成"偶发 404 罚过重"的场景——streak 只在**连续**无成功时累积，
-// 中间任何一次成功（NoteSuccess）都会把它清零；故只有持续 404 的坏号才会退避升级。
 func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
+	// 404 分流：偶发上游 404 的冷却基数固定 60s（notFoundCooldown），不取 soft_rate
+	// 的 600s 基数，也不受其配置值影响。Cooldown 重构后 404 是固定时长冷却
+	//（不堆加、不喂熔断），成功后自然到期恢复。
 	p := pool.New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	h := NewHandler(Config{Pool: p, SoftCooldown: 20 * time.Minute}) // soft_rate 配得很大，验证 404 不受其影响
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
-	for i, want := range []int64{notFoundSec, 2 * notFoundSec, 4 * notFoundSec} {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
+	for i := 1; i <= 3; i++ {
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
-			t.Fatalf("call %d: 应为 soft 冷却: %+v", i+1, st)
+			t.Fatalf("call %d: 应为 soft 冷却: %+v", i, st)
 		}
-		if st.SoftStreak != i+1 {
-			t.Errorf("call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
+		if st.SoftStreak != 0 {
+			t.Errorf("call %d: 404 固定冷却不应推进 soft_streak, got %d", i, st.SoftStreak)
 		}
-		// 基数取自 notFoundCooldown（60s）而非注入的 soft_rate（20m）。
-		if st.CoolRemaining < want-3 || st.CoolRemaining > want {
+		// 基数取自 notFoundCooldown（60s）而非注入的 soft_rate（20m），且重复触发不延长。
+		if st.CoolRemaining < notFoundSec-3 || st.CoolRemaining > notFoundSec {
 			t.Errorf("call %d: 404 cool_remaining_sec=%d want ~%d（固定基数 %ds，非 soft_rate）",
-				i+1, st.CoolRemaining, want, notFoundSec)
+				i, st.CoolRemaining, notFoundSec, notFoundSec)
 		}
-	}
-
-	// 成功后 streak 归零 → 下次 404 回到 60s 基数。
-	// （签到解冻 ReenableIfCredits 不适用于本场景：它保留 streak，是冷却域的续期。）
-	p.NoteSuccess("u1")
-	h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "")
-	if st, _ := p.Status("u1"); st.SoftStreak != 1 || st.CoolRemaining > notFoundSec {
-		t.Errorf("success should reset 404 backoff: %+v", st)
 	}
 }
 
@@ -989,18 +977,18 @@ func TestModelsDynamic(t *testing.T) {
 }
 
 func TestModelsDynamicFallsBackToStatic(t *testing.T) {
-	// 清缓存
+	// 纯动态化（产品决策）：上游失败 → 空列表（200），不再回落静态表——
+	// 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型。
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
 	dynamicModelsCache.fetched = time.Time{}
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
-	// 假上游 500
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1010,14 +998,14 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	// 回退静态表（≥5 个）
-	if len(data) < 5 {
-		t.Errorf("static fallback failed: %d", len(data))
+	if len(data) != 0 {
+		t.Errorf("pure-dynamic failure should yield empty list, got %d", len(data))
 	}
 }
 
 func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
-	// 清缓存
+	// 吸收上游 9832283：models 拉取失败只进负缓存，不 NoteError——
+	// NoteError 喂的是 chat 熔断器，models 端点 5xx 跨界惩罚 chat 通道健康号。
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
 	dynamicModelsCache.fetched = time.Time{}
@@ -1025,7 +1013,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
+	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：若仍罚号，一次 fetch 失败即熔断
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
@@ -1033,16 +1021,15 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
-		t.Fatalf("code=%d (static fallback)", rec.Code)
+		t.Fatalf("code=%d", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
+	if st.Cooling {
+		t.Fatalf("models fetch failure must not trip chat breaker: %+v", st)
 	}
 }
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
-	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
 	dynamicModelsCache.fetched = time.Time{}
@@ -1058,7 +1045,7 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
 	// 连续 3 次请求，上游持续 500 → 只应触发 1 次 fetch（负缓存生效），
-	// 其余走静态 fallback（仍返回 200）。
+	// 纯动态下空列表仍返回 200。
 	for i := 0; i < 3; i++ {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
@@ -1066,8 +1053,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	if calls != 1 {
-		t.Errorf("want 1 fetch, got %d", calls)
+	// 一轮探测 = 2 次上游调用（企业端点 + /v3/config 并发，两路全失败才进负缓存）。
+	if calls != 2 {
+		t.Errorf("want 2 probes (console + v3), got %d", calls)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1079,8 +1067,8 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 2 {
-		t.Errorf("want 2 fetch after cooldown, got %d", calls)
+	if calls != 4 {
+		t.Errorf("want 4 probes after cooldown (2 rounds x 2), got %d", calls)
 	}
 }
 
@@ -1489,9 +1477,13 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	if env.Error.Code != "content_blocked" {
 		t.Errorf("error.code=%q want content_blocked", env.Error.Code)
 	}
-	// 防火墙文案不得泄露上游 code 11128。
-	if strings.Contains(rec.Body.String(), "11128") {
-		t.Errorf("client body leaks upstream code 11128: %s", rec.Body.String())
+	// 错误透传（error-passthrough，吸收上游 5755fe3）：message 装上游 body 原文
+	// （code/msg 原样），客户端必须看到真实错误才能排查；gateway_hint 并列补充。
+	if !strings.Contains(rec.Body.String(), "11128") {
+		t.Errorf("message should carry upstream original body (passthrough): %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "gateway_hint") {
+		t.Errorf("content_blocked should carry gateway_hint: %s", rec.Body.String())
 	}
 	if h.degrade.Active() {
 		t.Error("degrade should NOT be active in custom mode")
