@@ -31,7 +31,15 @@ type StoreSnapshotter interface {
 	LoadState() ([]byte, bool)
 }
 
-// defaultIdle* 闲置补偿默认参数（claude-api selectWeightedRandom 参考口径）。
+// RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
+//
+// 本地**可用**时按新旧择一（快照不早于本地 → 采用快照，否则本地优先）；本地**不可用**
+// （state.json 缺失或不可读，典型为首次在新卷/新节点启动）时**采用快照**——此时本地根本
+// 没有可"优先"的状态，快照是本轮唯一的运行态来源，这正是快照作为「启动恢复备份」的核心
+// 场景。分支情形：无快照 / 快照无 savedAt → 本地优先（无判据可比）。
+//
+// 每种情形都打一条对应的恢复来源日志，便于对账。必须在 SyncToDir 之前调用
+// （SyncToDir 只增删不入值：值只能来自本地 load 或本函数采用快照）。
 func (p *Pool) RestoreFromSnapshot() {
 	store := p.store
 	if store == nil || p.stateFp == "" {
@@ -51,15 +59,25 @@ func (p *Pool) RestoreFromSnapshot() {
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
-	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
+	if localErr != nil {
+		// 本地不可用 → 采用快照（本地没有可"优先"的状态）。
+		//
+		// 旧实现把该情形与「本地较新」合并成同一个 fall-through：既不改内存、不置 dirty
+		//（有效快照被静默丢弃），又打出"本地 state.json（较新于 Redis 快照 …）"——一次
+		// 从未发生过的比较，把排障引向根本不存在的本地文件；随后 SyncToDir 只增删不入值，
+		// 全池运行态（credits/冷却/熔断计数/usedSeq/lastUsed）被清零。
+		p.adoptSnapshot(snap)
+		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)（本地 state.json 不可用: %v）",
+			snap.SavedAt.Format(time.RFC3339), localErr)
+		return
+	}
+	if !localInfo.ModTime().After(snap.SavedAt) {
 		// 快照不早于本地 → 采用快照。
-		p.mu.Lock()
-		p.applySnapshotLocked(snap)
-		p.mu.Unlock()
-		p.dirty.Store(true)
+		p.adoptSnapshot(snap)
 		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
 		return
 	}
+	// 走到这里必然是「本地存在且严格新于快照」，日志结论属实。
 	log.Printf("pool: 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
@@ -123,28 +141,51 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
 		}
+		// 旧版单档字段迁移：新两档都为空而旧字段有值时，并入 15d 档
+		//（旧口径无紧迫度区分，归入较宽的档更保守）。
 		exp15 := s.CreditsExpiring15d
 		if exp15 == 0 && s.CreditsExpiring7d == 0 && s.CreditsExpiring > 0 {
 			exp15 = s.CreditsExpiring
 		}
 		e := &entry{
-			creditsExpiring7d:  s.CreditsExpiring7d,
-			creditsExpiring15d: exp15,
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			creditsTotal:     s.CreditsTotal,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			until:            s.Until,
-			coolKind:         s.CoolKind,
-			successCount:     s.SuccessCount,
-			errTotal:         errTotal,
-			lastErr:          s.LastErr,
-			lastSuccess:      s.LastSuccess,
-			tokenUsage:       s.TokenUsage,
-			softStreak:       s.SoftStreak,
-			sessionDeadFails: s.SessionDeadFails,
-			consecutiveFails: s.ConsecutiveFails,
+			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:                  s.Credits,
+			creditsTotal:             s.CreditsTotal,
+			creditsExpiring7d:        s.CreditsExpiring7d,
+			creditsExpiring15d:       exp15,
+			disabled:                 s.Disabled,
+			paused:                   s.Paused,
+			reason:                   s.Reason,
+			until:                    s.Until,
+			coolKind:                 s.CoolKind,
+			successCount:             s.SuccessCount,
+			errTotal:                 errTotal,
+			lastErr:                  s.LastErr,
+			lastSuccess:              s.LastSuccess,
+			lastCheckinDay:           s.LastCheckinDay,
+			tokenUsage:               s.TokenUsage,
+			softStreak:               s.SoftStreak,
+			sessionDeadFails:         s.SessionDeadFails,
+			consecutiveFails:         s.ConsecutiveFails,
+		}
+		// 两档快过期快照惰性清洗：负值钳 0、超出总余额钳到 credits，并保持两档之和 ≤ credits。
+		if e.creditsExpiring7d < 0 {
+			e.creditsExpiring7d = 0
+		}
+		if e.creditsExpiring15d < 0 {
+			e.creditsExpiring15d = 0
+		}
+		if e.creditsExpiring7d > e.credits {
+			e.creditsExpiring7d = e.credits
+		}
+		if e.creditsExpiring15d > e.credits {
+			e.creditsExpiring15d = e.credits
+		}
+		if sum := e.creditsExpiring7d + e.creditsExpiring15d; sum > e.credits {
+			e.creditsExpiring15d = e.credits - e.creditsExpiring7d
+			if e.creditsExpiring15d < 0 {
+				e.creditsExpiring15d = 0
+			}
 		}
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
@@ -165,7 +206,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
@@ -186,6 +227,14 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
+// adoptSnapshot 采用 Redis 快照为当前池状态，并置 dirty 让下一次落盘把它物化回本地
+// state.json（否则快照只在内存生效，下次崩溃恢复又回到旧本地文件）。
+func (p *Pool) adoptSnapshot(s snapshot) {
+	p.mu.Lock()
+	p.applySnapshotLocked(s)
+	p.mu.Unlock()
+	p.dirty.Store(true)
+}
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
@@ -246,22 +295,24 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}, DefaultUID: p.defaultUID}
 	for uid, e := range p.byUID {
 		s := stateAccount{
-			CreditsExpiring7d:  e.creditsExpiring7d,
-			CreditsExpiring15d: e.creditsExpiring15d,
-			Credits:          e.credits,
-			CreditsTotal:     e.creditsTotal,
-			Disabled:         e.disabled,
-			Reason:           e.reason,
-			Until:            e.until,
-			CoolKind:         e.coolKind,
-			SuccessCount:     e.successCount,
-			ErrTotal:         e.errTotal,
-			LastSuccess:      e.lastSuccess,
-			LastErr:          e.lastErr,
-			TokenUsage:       e.tokenUsage,
-			SoftStreak:       e.softStreak,
-			SessionDeadFails: e.sessionDeadFails,
-			ConsecutiveFails: e.consecutiveFails,
+			Credits:                  e.credits,
+			CreditsTotal:             e.creditsTotal,
+			Disabled:                 e.disabled,
+			Paused:                   e.paused,
+			Reason:                   e.reason,
+			Until:                    e.until,
+			CoolKind:                 e.coolKind,
+			SuccessCount:             e.successCount,
+			ErrTotal:                 e.errTotal,
+			LastSuccess:              e.lastSuccess,
+			LastErr:                  e.lastErr,
+			LastCheckinDay:           e.lastCheckinDay,
+			TokenUsage:               e.tokenUsage,
+			SoftStreak:               e.softStreak,
+			SessionDeadFails:         e.sessionDeadFails,
+			ConsecutiveFails:         e.consecutiveFails,
+			CreditsExpiring7d:        e.creditsExpiring7d,
+			CreditsExpiring15d:       e.creditsExpiring15d,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
@@ -283,7 +334,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCooldowns == nil {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
-				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason}
+				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。

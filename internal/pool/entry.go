@@ -1,4 +1,4 @@
-// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约 + 三因子加权挑选 + state.json 持久化。
+// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约 + 最早到期优先/加权挑选 + state.json 持久化。
 package pool
 
 import (
@@ -37,17 +37,15 @@ type TokenUsage struct {
 	PromptTokens        int64     `json:"prompt_tokens,omitempty"`
 	CompletionTokens    int64     `json:"completion_tokens,omitempty"`
 	TotalTokens         int64     `json:"total_tokens,omitempty"`
-	// CreditsUsed 累计真实扣费（usage.credit 求和）。CreditsSamples 为提供了该字段的
-	// 尝试数——上游未返回 credit 的请求不计入，故二者一起才能判断均值是否可信。
-	CreditsUsed         float64   `json:"credits_used,omitempty"`
-	CreditsSamples      int64     `json:"credits_samples,omitempty"`
 	LastLatencyMs       int64     `json:"last_latency_ms,omitempty"`
 	LastTokensPerSecond *float64  `json:"last_tokens_per_second,omitempty"`
 	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
 	LastModel           string    `json:"last_model,omitempty"`
-	// LastCredits 最近一次**上游返回了 credit** 的请求的扣费值（0 是合法观测；
-	// 上游没给时保留上一次值不动）。
-	LastCredits         float64   `json:"last_credits,omitempty"`
+	// CreditsUsed / CreditsSamples 对话累计真实扣费（上游 usage.credit）。
+	// 上游没返回 credit 的请求不计入（CreditsSamples 记「有数据」的样本数），
+	// 因此 CreditsUsed/CreditsSamples 才是可信均值；两者同为 0 = 尚未观测到扣费。
+	CreditsUsed    float64 `json:"credits_used,omitempty"`
+	CreditsSamples int64   `json:"credits_samples,omitempty"`
 }
 
 // TokenUsageDelta 是一次聊天账号尝试的 usage 增量。
@@ -60,22 +58,22 @@ type TokenUsageDelta struct {
 	CompletionTokens    int64
 	HasTotalTokens      bool
 	TotalTokens         int64
-	// Credits 本次请求上游返回的真实扣费（usage.credit，上游 2026-09-13 起提供）。
-	// HasCredits=false 表示上游没给该字段——与"扣了 0"不同，不累计也不伪造。
-	HasCredits bool
-	Credits    float64
 	HasLatencyMs        bool
 	LatencyMs           int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
+	// HasCredits/Credits 本次尝试的真实扣费（上游 usage.credit）。
+	// HasCredits=false 表示上游未给该字段（与"扣了 0"区分），不计入成本台账。
+	HasCredits bool
+	Credits    float64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname,omitempty"`
+	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring7d / CreditsExpiring15d 两档**互斥**的快过期积分子集，都是 Credits 的一部分。
 	// 7d = ≤7 天到期（更紧迫，权重更高）；15d = ≤15 天但 >7 天到期。
 	// 选号权重对两档分别加成（见 pick.go expiringWeight7d/15d）。
@@ -83,12 +81,12 @@ type Status struct {
 	CreditsExpiring15d int64 `json:"credits_expiring_15d,omitempty"`
 	// Default 该账号是否为「默认账号」：开启后普通请求优先使用它（见 pick 的默认号短路）。
 	Default bool `json:"default,omitempty"`
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	Cooling                  bool      `json:"cooling"`
+	CoolKind                 string    `json:"cool_kind,omitempty"`
+	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
+	Until                    time.Time `json:"until,omitempty"`
+	Reason                   string    `json:"reason,omitempty"`
+	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
@@ -96,13 +94,25 @@ type Status struct {
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm           string     `json:"realm,omitempty"`
+	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
+	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
+	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
+	Enterprise      bool       `json:"enterprise,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
+	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
+	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
+	// 账号本身健康，只是暂不接流量。
+	Paused          bool       `json:"paused,omitempty"`
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
 	LastErrTime     time.Time  `json:"last_err,omitempty"`
-	TokenUsage      TokenUsage `json:"token_usage,omitempty"`
+	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
+	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
+	CheckinDone bool        `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -135,6 +145,8 @@ type ModelCostStatus struct {
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
 type RateLimitedModel struct {
 	Model string `json:"model"`
+	// Kind 区分限流与模型不可用：6004 是 rate_limit，11102 是 model_unavailable。
+	Kind string `json:"kind"`
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
 	Until time.Time `json:"until,omitempty"`
@@ -161,6 +173,9 @@ type modelCooldown struct {
 	Reason string
 	// Hits 11102 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
 	Hits int
+	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
+	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
+	AuditOnly bool
 }
 
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
@@ -191,16 +206,24 @@ type entry struct {
 	// 运行态，签到/余额刷新时更新；随 state.json 持久化（重启后不失效到下次签到）。
 	creditsExpiring7d  int64
 	creditsExpiring15d int64
-	successCount    int64      // 累计成功
-	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr         time.Time  // 最近一次错误时间
-	lastSuccess     time.Time  // 最近一次成功时间
-	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	successCount             int64      // 累计成功
+	errTotal                 int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr                  time.Time  // 最近一次错误时间
+	lastSuccess              time.Time  // 最近一次成功时间
+	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
+	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
+	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
+	// 签到/已签。持久化：跨重启不丢当日状态。
+	lastCheckinDay string
+	coolKind       CoolKind
+	until          time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled       bool
+	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
+	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
+	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
+	paused         bool
+	reason         string
+	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -270,7 +293,7 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled {
+	if e.disabled || e.paused {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -291,8 +314,15 @@ func (e *entry) healthy(now time.Time) bool {
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
-	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
+	if e.disabled || e.paused || !e.until.IsZero() || !e.degradeUntil.IsZero() || !e.breakerUntil.IsZero() {
+		return false
+	}
+	for _, mc := range e.modelCooldowns {
+		if !mc.AuditOnly && !mc.Until.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -302,7 +332,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 		return false
 	}
 	mc, ok := e.modelCooldowns[reqModel]
-	if !ok {
+	if !ok || mc.AuditOnly {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
@@ -318,7 +348,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if e.disabled {
+	if e.disabled || e.paused {
 		return false
 	}
 	if e.modelCooled(now, reqModel) {
@@ -327,6 +357,32 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	}
 	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
 	return e.healthy(now)
+}
+
+// pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
+// pruneExpiredModelCooldowns 同形同调用点）。
+//
+// 为什么必须有它：modelCost 此前只在**读**（modelCostOf）、**落盘**（persist）、
+// **恢复**（persist）、**status**（state.go）四处做"过期过滤"，内存里的条目本身
+// 从不回收——即「map 只增不减」。而 entry.modelCost 的注释明确声称
+// 「落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）」，
+// 模型级冷却表正是靠 pruneExpiredModelCooldowns 在 pick 写锁路径做真正删除的
+// （见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
+// 永久占据一条内存（进程重启才清），并在后续每一轮 pick 的遍历、每次 status 遍历里
+// 被反复判定为过期（只是没人删）。
+//
+// 观测只在成功请求路径写入（NoteModelCost），且 model 不与目录校验，故增长受
+// "历史服务过的模型名"限制——不是无界泄漏，但同样是"只增不减"的无回收表。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelCosts(now time.Time) {
+	if len(e.modelCost) == 0 {
+		return
+	}
+	for m, mc := range e.modelCost {
+		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+			delete(e.modelCost, m)
+		}
+	}
 }
 
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
@@ -381,15 +437,8 @@ func (e *entry) fallbackKind(now time.Time) string {
 type stateAccount struct {
 	Credits      int64     `json:"credits"`
 	CreditsTotal int64     `json:"credits_total,omitempty"`
-	// CreditsExpiring7d / CreditsExpiring15d 两档互斥的快过期可用积分子集，是 credits 的一部分。
-	// 随 credits 一同持久化，保证重启后「快过期优先」不会静默失效到下次签到。
-	// 旧 state.json 无这两字段 → 零值（退化为"无快过期积分"，行为与引入前一致）。
-	CreditsExpiring7d  int64 `json:"credits_expiring_7d,omitempty"`
-	CreditsExpiring15d int64 `json:"credits_expiring_15d,omitempty"`
-	// CreditsExpiring 旧版单档字段（≤expiring_soon 窗口）。仅作一次性迁移源读取：
-	// 加载时并入 15d 档（旧口径默认窗口 7 天，最接近 15d 档语义），不再回写。
-	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
 	Disabled     bool      `json:"disabled"`
+	Paused       bool      `json:"paused,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
 	CoolKind     CoolKind  `json:"cool_kind"`
@@ -397,10 +446,13 @@ type stateAccount struct {
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount    int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess time.Time  `json:"last_success,omitempty"`
-	LastErr     time.Time  `json:"last_err,omitempty"`
-	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
+	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess    time.Time  `json:"last_success,omitempty"`
+	LastErr        time.Time  `json:"last_err,omitempty"`
+	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
+	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
+	LastCheckinDay string     `json:"last_checkin_day,omitempty"`
+	TokenUsage     TokenUsage `json:"token_usage,omitempty"`
 	// 运行态计数（soft_streak/session_dead_fails/credits_expiring）不用 omitempty：
 	// 零值缺失会让人误以为"没记录"，实际是零值被省略。
 	SoftStreak int `json:"soft_streak"`
@@ -421,6 +473,14 @@ type stateAccount struct {
 	// RetryCount 已熔断次数（指数退避的指数）。持久化以保留"越熔越长"的退避累积——
 	// 重启归零会让反复熔断只从最小退避开始。恢复时若 BreakerUntil 已过期则归零。
 	RetryCount int `json:"retry_count,omitempty"`
+	// CreditsExpiring7d / CreditsExpiring15d 两档互斥的快过期可用积分子集，是 credits 的一部分。
+	// 持久化以保留到期路由（快过期优先）的偏好——重启后到下次签到之间不应失忆。
+	CreditsExpiring7d  int64 `json:"credits_expiring_7d,omitempty"`
+	CreditsExpiring15d int64 `json:"credits_expiring_15d,omitempty"`
+	// CreditsExpiring 旧版单档字段（≤expiring_soon 窗口）。仅作一次性迁移源读取：
+	// 恢复时若新两档都为空而旧字段有值，把它并入 15d 档（旧口径是"快过期优先"，
+	// 无紧迫度区分，归入较宽的档更保守）。不再回写。
+	CreditsExpiring int64 `json:"credits_expiring,omitempty"`
 	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11102
 	// 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。
@@ -437,9 +497,10 @@ type stateAccount struct {
 // modelCooldown 同构（Until/ResetAt/Reason 字段名与语义对齐），落盘/恢复往返无损。
 // Hits 不落盘（重启后 11102 退避从 6h 基数重新学习，同 modelCost 口径）。
 type stateModelCooldown struct {
-	Until   time.Time `json:"until"`
-	ResetAt time.Time `json:"reset_at,omitempty"`
-	Reason  string    `json:"reason,omitempty"`
+	Until     time.Time `json:"until"`
+	ResetAt   time.Time `json:"reset_at,omitempty"`
+	Reason    string    `json:"reason,omitempty"`
+	AuditOnly bool      `json:"audit_only,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
@@ -453,8 +514,7 @@ type stateModelCost struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
-	// DefaultUID 「默认账号」UID（空 = 未设置）。旧 state.json 无此字段 → 零值，
-	// 行为与引入前一致（纯加权轮换）。
+	// DefaultUID 「默认账号」UID（空 = 未设置）。随 state.json 持久化，重启后保留。
 	DefaultUID string `json:"default_uid,omitempty"`
 }
 
@@ -475,6 +535,13 @@ const (
 	defaultDegradeCooldown    = 10 * time.Minute
 	defaultDegradeCooldownMax = 2 * time.Hour
 )
+
+// defaultCostExploreInterval costTier 条件探索的默认窗口（issue #136 方案 a′）。
+// 取 30m：≤ 48 次/天/模型 的探索上限算术（24h/30m=48），与池规模和 QPS 无关。
+// 探索=搭车改道（把一个既有真实用户请求改道给 tier 1 号），零新增上游请求；
+// 增量成本只是「该请求本可打免费号、实际打了可能收费的号」的期望计费差，
+// 且 tier 1 枯竭（活跃模型全号已学）后税基收敛到 0。config 显式 "0" 关停。
+const defaultCostExploreInterval = 30 * time.Minute
 
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
 // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为

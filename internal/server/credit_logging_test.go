@@ -56,7 +56,7 @@ func TestChatStatsReaderParsesCredit(t *testing.T) {
 			break
 		}
 	}
-	c, ok := r.Credits()
+	c, ok := r.Credit()
 	if !ok {
 		t.Fatal("Credits() ok=false, want true（末帧带 credit）")
 	}
@@ -85,7 +85,7 @@ func TestChatStatsReaderCreditMissing(t *testing.T) {
 			break
 		}
 	}
-	if _, ok := r.Credits(); ok {
+	if _, ok := r.Credit(); ok {
 		t.Error("Credits() ok=true, want false（上游没给 credit 字段）")
 	}
 	if d := r.Usage(); d.HasCredits {

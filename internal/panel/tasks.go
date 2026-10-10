@@ -38,6 +38,20 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
+	// 合并小程序口径任务（school_season / Sequential_Tasks_1 等仅在 mp 头列表下发）。
+	// mp 列表是默认口径的超集（实测含常规任务），按 task_code 去重；失败静默。
+	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+		seen := map[string]bool{}
+		for _, t := range tasks {
+			seen[t.TaskCode] = true
+		}
+		for _, t := range mpTasks {
+			if !seen[t.TaskCode] {
+				tasks = append(tasks, t)
+				seen[t.TaskCode] = true
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "tasks": tasks})
 }
 
@@ -108,6 +122,25 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		accepted += end - i
 		time.Sleep(acceptBatchGap) // 批间节流（对齐脚本 1.05s 口径）
 	}
+	// 小程序口径任务单独批量接受（默认列表不含 mp 码，accept 也要求 mp 头）。
+	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+		var mpCodes []string
+		for _, t := range mpTasks {
+			if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
+				continue
+			}
+			mpCodes = append(mpCodes, t.TaskCode)
+		}
+		if len(mpCodes) > 0 {
+			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
+				log.Printf("panel: mp 批量接受失败 uid=%s err=%v", uid, err)
+				failed = append(failed, mpCodes...)
+			} else {
+				accepted += len(mpCodes)
+				time.Sleep(acceptBatchGap)
+			}
+		}
+	}
 	log.Printf("panel: 全部接受 uid=%s 接受=%d 失败=%d", uid, accepted, len(failed))
 	resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
 	if len(failed) > 0 {
@@ -130,7 +163,14 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}
-	credit, energy, err := p.cfg.Upstream.ClaimReward(a, body.TaskCode)
+	// 小程序口径任务走 chat 域 mp 头领奖（缺头实测不可领）；其余 Web 端接口。
+	var credit, energy int64
+	var err error
+	if isMPTaskCode(body.TaskCode) {
+		credit, energy, err = p.cfg.Upstream.ClaimRewardMP(a, body.TaskCode)
+	} else {
+		credit, energy, err = p.cfg.Upstream.ClaimReward(a, body.TaskCode)
+	}
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
 		return

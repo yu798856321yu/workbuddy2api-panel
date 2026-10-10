@@ -67,13 +67,21 @@ func New(cfg Config) *Router {
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
+//
+// stop channel 必须在启 goroutine 前捕获到**局部变量**：goroutine 在 select 里
+// 每轮重新求值 r.stop 是无锁读，而 StopGC 持写锁把它置 nil——既是数据竞争
+// （-race 可复现），又会在读到 nil 后让该 case 永久阻塞（nil channel 永不就绪），
+// 于是关停彻底失效：goroutine 再也不会退出，ticker 无限触发 gcOnce（goroutine
+// 泄漏 + 关停后仍持续 GC）。捕获局部变量后，close(stop) 与 select 观测的是同一个
+// channel，StopGC 一定能让 goroutine 退出。
 func (r *Router) StartGC() {
 	r.mu.Lock()
 	if r.stop != nil {
 		r.mu.Unlock()
 		return
 	}
-	r.stop = make(chan struct{})
+	stop := make(chan struct{})
+	r.stop = stop
 	r.mu.Unlock()
 
 	go func() {
@@ -81,7 +89,7 @@ func (r *Router) StartGC() {
 		defer t.Stop()
 		for {
 			select {
-			case <-r.stop:
+			case <-stop:
 				return
 			case <-t.C:
 				r.gcOnce(time.Now())
@@ -299,9 +307,11 @@ func hashIndex(key string, n int) int {
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
-//  5. 派生键：system 提示词 + 首条用户消息的哈希（客户端不发会话 id 时的回退）
+//  5. prompt_cache_key（OpenAI 前缀缓存键，见下）
+//  6. 派生键：system 提示词 + 首条用户消息的哈希（客户端不发会话 id 时的回退，
+//     带 user_id 的请求不派生——见下方契约说明）
 //
-// 全部为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+// 前 5 项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
 // （P1-anti-monopoly 剔除）：user 维度粒度过粗——一个 user 的全部并行对话
 // 会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），且曾抢占顶层
 // conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换（与无标识
@@ -310,6 +320,18 @@ func hashIndex(key string, n int) int {
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
 // snake_case 优先级高于 camelCase（同值不同名命中同一对话时返回相同值，天然不混用）。
+//
+// 第 5 项 prompt_cache_key：pi-ai 驱动的客户端（dsh 等）把会话 ID 放在这个 OpenAI
+// 前缀缓存字段里（而非 conversation_id），网关在 upstream 侧本就认它（见
+// InjectPromptCacheKey 优先级 1：客户端自带则原值保留）。纳入识别后，这类客户端
+// 无需改配置即可命中粘性。置于显式会话键之后、派生键之前，绝不抢占 conversation
+// 维度的优先级。
+//
+// 派生键的 user_id 抑制（P1-anti-monopoly 契约在 fallback 路径的延伸）：body 携带
+// metadata.user_id 或顶层 user_id 时**不派生**。ExtractKey 有意剔除 user_id 作粘性键
+// （user 维度粒度过粗——一个 user 的全部并行对话会被钉到同一账号），若派生路径不设
+// 此闸，只发 user_id 的请求会借内容哈希重新获得粘性，使该契约在 fallback 路径失效
+// （上游 #169 同款回归修正）。这类客户端回落加权轮换。
 func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -332,7 +354,27 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["conversationId"]); v != "" {
 		return v
 	}
+	// 5. prompt_cache_key：OpenAI 系的会话级前缀缓存键，语义就是"同一会话复用同一
+	//    前缀"，与粘性诉求同源。放显式会话键之后、派生键之前，不抢占优先级。
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	// 派生回退闸：带 user 维度标识的请求不派生（契约见上）。
+	if hasUserIDKey(obj) {
+		return ""
+	}
 	return deriveKey(obj)
+}
+
+// hasUserIDKey 报告已解析 body 是否携带 user 维度标识（metadata.user_id 或顶层
+// user_id，非空字符串才算）。只用于派生回退闸（ExtractKey）；解析失败按无处理。
+func hasUserIDKey(obj map[string]any) bool {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if strOrEmpty(meta["user_id"]) != "" {
+			return true
+		}
+	}
+	return strOrEmpty(obj["user_id"]) != ""
 }
 
 // derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
@@ -366,7 +408,10 @@ func deriveKey(obj map[string]any) string {
 			}
 		case "user":
 			if firstUserText == "" {
-				firstUserText = text
+				// 首条 user 用内容签名（ids.go contentSignature）而非纯文本提取：
+				// 纯图片轮（无 text part）在 messageText 下恒空串 → 派生键失效
+				//（首图会话的粘性盲区）；签名口径下图片 part 以 [type:摘要] 入键。
+				firstUserText = userContentSignature(msg["content"])
 			}
 		}
 		if firstUserText != "" && systemText != "" {
@@ -378,6 +423,61 @@ func deriveKey(obj map[string]any) string {
 	}
 	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// userContentSignature 把已解析的 content（any）转回 RawMessage 后取**会话级稳定**
+// 签名，供 deriveKey（粘性键）专用。与 TurnKey 的 contentSignature（全文摘）不同：
+// 文本 part 照常拼接；非文本 part 只入 "[type]" 占位**不入内容摘要**——同一逻辑
+// 图片的 URL 逐轮变化（签名 URL/重编码 base64）是真实场景，内容摘要入键会让
+// 派生键随轮漂移、粘性名存实亡（fork 既有契约：image url changes must not
+// break derived key stability）。占位仍能区分"有无图片/图片数量"，纯图片首条
+// 消息（无 text part）由此可派生非空键（首图会话粘性盲区修复，对齐上游 G1
+// 的目标语义而保留 fork 的稳定性口径）。marshal 失败按无内容处理（不伪造）。
+func userContentSignature(content any) string {
+	raw, err := json.Marshal(content)
+	if err != nil {
+		return ""
+	}
+	st := strings.TrimSpace(string(raw))
+	if st == "" || st == "null" {
+		return ""
+	}
+	if st[0] == '"' {
+		var str string
+		if json.Unmarshal(raw, &str) != nil {
+			return ""
+		}
+		return str
+	}
+	if st[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var b strings.Builder
+	hasNonText := false
+	for _, pr := range parts {
+		var p struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(pr, &p) != nil {
+			return ""
+		}
+		if p.Type == "" || p.Type == "text" {
+			b.WriteString(p.Text)
+			continue
+		}
+		hasNonText = true
+		b.WriteString("\n[" + p.Type + "]\n")
+	}
+	out := b.String()
+	if !hasNonText {
+		return out
+	}
+	return strings.TrimSpace(out)
 }
 
 // messageText 提取消息 content 的文本表示。

@@ -4,7 +4,16 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "max_body_mb": 8
+    "read_timeout": "300s"
+  },
+  "panel": {
+    "package_detail_limit": 5
+  },
+  "logging": {
+    "request_archive_enabled": true,
+    "request_retention_days": 7,
+    "request_archive_max_mb": 100,
+    "request_client_info": true
   },
   "cooldown": {
     "soft_rate": "600s",
@@ -12,17 +21,20 @@
   },
   "schedule": {
     "checkin_hours": [9, 21],
+    "growth_hours": [1],
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
     "blackcat_hours": [23],
     "checkin_enabled": true,
+    "growth_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
-    "balance_refresh_minutes": 5
+    "balance_refresh_minutes": 5,
+    "include_disabled_in_tasks": false
   },
   "global": {
     "enabled": true,
@@ -63,7 +75,11 @@
     "degrade_cooldown_max": "2h",
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
-    "expiring_soon": "168h"
+    "prefer_expiring": true,
+    "expiring_soon_7d": "168h",
+    "expiring_soon_15d": "360h",
+    "cost_explore_interval": "30m",
+    "credit_floor": 100
   },
   "session_sticky": {
     "enabled": true,

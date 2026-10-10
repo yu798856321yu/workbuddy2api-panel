@@ -82,7 +82,7 @@ func billingAndGrowthServer(stub *travelStub) *httptest.Server {
 		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
-			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
 		case strings.HasSuffix(r.URL.Path, "/token/refresh"):
 			w.Write([]byte(`{"code":0,"data":{"accessToken":"new","expiresIn":3600}}`))
 		default:

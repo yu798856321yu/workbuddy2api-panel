@@ -1,13 +1,15 @@
-// 选号：Pick 簇（healthy 三因子加权 Top5 短名单 + 加权随机 + 全冷却兜底 + 在途占满过滤）。
+// 选号：Pick 簇（healthy 成本分层 + 快过期虚拟实例权重 + 全冷却兜底 + 在途占满过滤）。
 package pool
 
 import (
 	"log"
 	"math/rand/v2"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/yu798856321yu/workbuddy2api-panel/internal/auth"
+	"github.com/yu798856321yu/workbuddy2api-panel/internal/logfmt"
 )
 
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
@@ -49,7 +51,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if reqModel != "" {
 		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
 	}
-	// 默认账号短路：面板设了默认号且它当前可用时直取，跳过加权抽签与防惊群窗口——
+	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
+	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
+	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
+	// 默认账号短路：面板设了默认号且它当前可用时直接取它，跳过加权抽签与防惊群窗口——
 	// 用户显式指定优先于负载均摊，这正是「指定用哪个账号」的语义。
 	if e := p.pickDefaultLocked(tried, reqModel, realm, now); e != nil {
 		return e.a
@@ -59,9 +64,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		e.pruneExpiredModelCooldowns(now) // 惰性清理过期模型级冷却（防 map 膨胀）
+		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
+		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
+		e.pruneExpiredModelCooldowns(now)
+		e.pruneExpiredModelCosts(now)
 		if !healthyOf(e) {
 			continue
+		}
+		if floorBlocked(e) {
+			continue // 积分保底：触底号不接实测收费模型（tier 0/1 不受限）
 		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
@@ -71,10 +82,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
 	}
-	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
-	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
+	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
+	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
 	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
 	// 抽签权重共享同一基准，两个阶段权重可比。
 	var maxCredits int64
@@ -102,9 +113,36 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		return 2, mc.CostPer1k
 	}
 	bestTier := 2
+	hasTier1 := false
+	explored := false // 本次 pick 是否切了探索层（事件日志在选中号确定后打）
 	for _, e := range cands {
 		if ti, _ := costTier(e); ti < bestTier {
 			bestTier = ti
+		}
+	}
+	// 条件探索（issue #136 方案 a′）：tier 0 垄断层存在（bestTier==0 且 reqModel
+	// 非空）且候选含 tier 1（冻结存在）且距上次探索 ≥ 窗口（零值 timer=从未探索
+	// →首次满足即探）时，本次 pick 生效层切 tier 1-only——探索=搭车改道，把一个
+	// 既有真实用户请求改道给未知号（零新增上游请求；IP 维度零增量，WAF 友好）。
+	// 成功 → NoteModelCost 首观测 → 毕业（tier 0/2，下一轮 pick 立即生效）；
+	// 失败 → 既有错误策略照常，无探测风暴。
+	// hasTier1 复用本循环上方 costTier 的预计算口径（每候选一次的契约不变）。
+	// timer 同锁写入：并发 pick 串行进入写锁，只有一个进入者能通过窗口判定
+	//（天然防重复探索）。key = realm + "\x1f" + reqModel：同模型名可跨域，
+	// 探索节奏按 (域, 模型) 独立；realm==""（Pick 老语义）单独成键。
+	if p.costExploreInterval > 0 && bestTier == 0 && reqModel != "" {
+		for _, e := range cands {
+			if ti, _ := costTier(e); ti == 1 {
+				hasTier1 = true
+				break
+			}
+		}
+		key := realm + "\x1f" + reqModel
+		if hasTier1 && now.Sub(p.exploreLast[key]) >= p.costExploreInterval {
+			p.exploreLast[key] = now
+			p.costExploreEvents++
+			bestTier = 1
+			explored = true
 		}
 	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
@@ -120,7 +158,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
 		}
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
@@ -163,17 +201,17 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) > 5 {
 		cands = cands[:5]
 	}
+	var e *entry
 	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
 	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
 	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
 	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
 	eligible := make([]*entry, 0, len(cands))
-	for _, e := range cands {
-		if now.Sub(e.lastUsed) >= minPickGap {
-			eligible = append(eligible, e)
+	for _, c := range cands {
+		if now.Sub(c.lastUsed) >= minPickGap {
+			eligible = append(eligible, c)
 		}
 	}
-	var e *entry
 	if len(eligible) == 0 {
 		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
 		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
@@ -188,10 +226,69 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	} else {
 		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
 	}
+	if explored {
+		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
+		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
+		// 常规路径）。
+		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
+			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
 	return e.a
+}
+
+// floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
+// 路径的单一事实来源）：floor>0 且账号触底（credits < floor）且该模型**收费**
+// 时为真。
+//
+// 收费判据两级（任一成立即判收费 → 拦）：
+//  1. 本地实测台账（e.modelCostOf）：该号在该模型上实测 cost>0（tier 2）。
+//  2. 上游目录倍率（p.modelRateOf）：本地无观测/观测过期（tier 1）时的兜底。
+//     只看实测会让「无观测」恒等于「放行」——而高价新模型恰恰全池无观测
+//     （kimi-k3-1 实案：x1.62、223 分/百万 token，两笔打穿 100 分的号并触发
+//     硬冷却到次日 04:00）。倍率由上游随模型目录下发，请求前即已知，不必付学费。
+//
+// 不拦的情形：
+//   - 模型免费：本地实测 cost<=0（tier 0），或目录倍率为 0/"0.00"。保底的目的
+//     正是「留余额给免费模型用」——但若账号已归零，上游仍会 402（余额门禁是
+//     账号级的，与模型无关），此时由 ErrHardCredit 冷却承接，与本判定无关。
+//   - 模型倍率未知（台账无观测且目录未下发该模型）：无法判收费，按放行处理。
+//     这是有意的保守选择——目录未覆盖的模型多为内部/别名模型，拦了会让号
+//     永久失联；风险由「未知」本身承担，但已知收费的一律拦。
+//   - model 为空（无模型上下文）不拦：无成本维度，floor 无从判收费。
+//
+// 余额用本地插值口径（签到权威值 - 每笔 usage.credit 实扣，见 NoteModelCost）：
+// 只会偏低不会偏高（官方对账延迟方向安全），正是保底需要的安全方向。
+// 调用方必须已持有 p.mu（读 e.credits / e.modelCost / p.modelRateOf）。
+func (p *Pool) floorBlockedForModel(e *entry, model string, now time.Time) bool {
+	return p.floorBlockedForRealmModel(e, model, "", now)
+}
+
+// floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
+// 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
+func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
+	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
+		return false
+	}
+	// 1) 本地实测台账：最权威（真实扣费证据）。
+	if mc, ok := e.modelCostOf(model, now); ok {
+		return mc.CostPer1k > 0
+	}
+	// 2) 上游目录倍率兜底：无实测观测时用牌价判收费，堵住「无观测 = 放行」漏洞。
+	if p.modelRateOf == nil {
+		return false
+	}
+	rate := p.modelRateOf(realm, model)
+	if rate == "" {
+		return false // 目录未覆盖：未知，放行（见上方注释）
+	}
+	v, err := strconv.ParseFloat(rate, 64)
+	if err != nil {
+		return false // 倍率非数值（异常形态）：不据此惩罚账号
+	}
+	return v > 0
 }
 
 // pickDefaultLocked 默认账号直取：面板设了默认号、且它当前满足本轮可用条件时返回它。
@@ -199,6 +296,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // 可用条件（全部满足才直取，任一不满足即返回 nil 走普通轮换）：
 //   - tried 未包含它：本轮已试过（失败/换号中）就不再重复选，避免死循环重试同一号；
 //   - 账号存在且 healthyOf(e)：健康口径与普通选号一致（realm 过滤 + 6004 模型豁免）；
+//   - 积分保底放行（不触底于收费模型）；
 //   - 在途未满：并发超过 maxInFlight 时溢出到其他号，避免默认号被压垮。
 //
 // 调用方必须已持有 p.mu。返回 nil 表示"不适用默认号"，调用方照常走加权轮换。
@@ -221,6 +319,9 @@ func (p *Pool) pickDefaultLocked(tried map[string]bool, reqModel, realm string, 
 	if !healthy || p.inFlightFull(e) {
 		return nil
 	}
+	if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
+		return nil // 积分保底：默认号触底时不接收费模型，静默回落到普通轮换
+	}
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
@@ -231,7 +332,12 @@ func (p *Pool) pickDefaultLocked(tried map[string]bool, reqModel, realm string, 
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+//
+// 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
+// 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
+// floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
+// 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -240,11 +346,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if realm != "" && e.a.Realm() != realm {
 			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
 		}
-		if e.disabled {
-			continue // 禁用的账号永不参与兜底
+		if e.disabled || e.paused {
+			continue // 禁用/暂停选号的账号永不参与兜底
 		}
 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+		}
+		if p.floorBlockedForRealmModel(e, model, realm, now) {
+			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
 		}
 		if p.inFlightFull(e) {
 			continue
@@ -260,8 +369,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s", best.a.UID, best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
+	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
+	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
+	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
+	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
+	p.pickSeq++
+	best.usedSeq = p.pickSeq
 	return best.a
 }
 
@@ -279,15 +394,14 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
 
-// pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
+// pickWeighted 加权随机（claude-api selectWeightedRandom 参考口径）：
 //
-//		weight = credits 比例 × 10 + idleWeight + successRate × 3
+//		weight = credits 比例 × 10 + idleWeight
 //
 //	  - credits 比例 = 该号 credits / 候选集内最大 credits（避免量纲爆炸）
 //	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
-//	  - successRate = successCount/(successCount+errTotal)；无请求记录给 1.5（中性偏信任）
 //
-// credits 全 0 时仍按 idle+successRate 加权（不退化均匀随机）。
+// credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
 func (p *Pool) pickWeighted(cands []*entry) *entry {
@@ -302,7 +416,7 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	weights := make([]int64, len(cands))
 	var total int64
 	for i, e := range cands {
-		w := p.weightOf(e, maxCredits, now)
+		w := p.routingWeightOf(e, maxCredits, now)
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
@@ -324,7 +438,7 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	return cands[len(cands)-1]
 }
 
-// weightOf 计算单个账号的三因子权重。
+// weightOf 计算单个账号的普通加权分值。
 func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
@@ -339,7 +453,8 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	//
 	// 与 credits 总量项正交：那是按总量，这是按过期紧迫度。
 	// 两档互斥（见 SetCreditsDetailed），同一笔积分只会被加一次权重。
-	if e.credits > 0 {
+	// 总开关 prefer_expiring 关闭时完全不使用到期信息（与上游开关语义一致）。
+	if p.preferExpiring && e.credits > 0 {
 		if e.creditsExpiring7d > 0 {
 			w += float64(e.creditsExpiring7d) / float64(e.credits) * expiringWeight7d
 		}
@@ -367,15 +482,28 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
-// SetCredits 更新账号余额。
+// expiringNow 报告账号是否存在快过期积分（两档任一 > 0 即算）。
+// 用于新会话候选集的虚拟实例加权（realm.go）：快过期账号被多放几份名额，
+// 使新会话更可能落到它身上、把快过期积分先消耗掉。
+func expiringNow(e *entry, now time.Time) bool {
+	return e.creditsExpiring7d > 0 || e.creditsExpiring15d > 0
+}
 
-// 快过期积分占比的权重系数（三因子之外的第四因子，分两档）。
+// expiringWeight7d / expiringWeight15d 快过期积分占比的权重系数（三因子之外的第四因子，分两档）。
 //
 // 取值逻辑：都略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间
 // 拉开差距，又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
-// 7 天档（×9）高于 15 天档（×5），体现"越紧迫越优先"：
+// 7 天档（×9）高于 15 天档（×5），体现"越紧迫越优先"；
 // 7 天档满额时加成 9，接近总量项满额（10）——一周内作废的积分优先级接近"总量最大"。
 const (
 	expiringWeight7d  = 9.0
 	expiringWeight15d = 5.0
 )
+
+// routingWeightOf 账号的最终选号权重。两档快过期加成已并入 weightOf（第四因子），
+// 此处保留为统一入口，语义等价于 weightOf。
+func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
+	return p.weightOf(e, maxCredits, now)
+}
+
+// SetCredits 更新账号余额。

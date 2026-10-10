@@ -15,7 +15,9 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 
@@ -27,6 +29,10 @@ const (
 	tasksListPath   = "/v2/activity/growth/tasks"
 	tasksAcceptPath = "/v2/activity/growth/tasks/accept"
 )
+
+// mpPlatform 小程序口径头值：小程序限定任务（Sequential_Tasks_1 / school_season）
+// 的列表下发、accept、claim 全链路要求 X-Client-Platform: miniprogram。
+const mpPlatform = "miniprogram"
 
 // Task 单个任务的对外视图（字段名与上游 JSON 对齐，多余字段不透出）。
 type Task struct {
@@ -50,7 +56,7 @@ type Task struct {
 	Claimed      bool   `json:"claimed,omitempty"`   // 已领取（accept_status == claimed）
 }
 
-// ListTasks 拉取全量任务列表。
+// ListTasks 拉取全量任务列表（默认口径，无端标记头）。
 // 响应形如 data.tasks[]，元素字段随任务类型变化（progress 可能是 {current,target} 或平铺），
 // 这里做宽松解析：两种形状都尝试。
 func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
@@ -58,6 +64,87 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseGrowthTasks(data)
+}
+
+// ListTasksMP 拉取小程序口径的任务列表（X-Client-Platform: miniprogram）。
+// 小程序限定任务（Sequential_Tasks_1「小程序首对话」/ school_season「校园日」等）
+// 仅在该口径下发——默认列表不出现，accept/claim 同样要求该头（缺头 accept 返回
+// task not found，上游 task_runner 实测）。**实测 mp 列表是默认口径的超集**
+// （含 RichMeow/Model_chat 等常规任务 + wb_wechat_oa_subscribe_task 等 mp 专属），
+// 合并时调用方须按 task_code 去重。
+func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
+	data, err := c.growthJSONMP(a, http.MethodGet, tasksListPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	return parseGrowthTasks(data)
+}
+
+// growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
+// 并解信封。语义同 growthJSON。
+func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	c.BillingHeaders(req, a)
+	req.Header.Set("X-Client-Platform", mpPlatform)
+	return c.doJSON(req)
+}
+
+// AcceptTasksMP 接受小程序限定任务（mp 头；缺头实测 task not found）。
+// 幂等语义同 AcceptTasks。
+func (c *Client) AcceptTasksMP(a *auth.Auth, taskCodes []string) error {
+	_, err := c.growthJSONMP(a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
+	return err
+}
+
+// ClaimRewardMP 领取小程序限定任务奖励：chat 域 /activity/growth/tasks/{code}/claim
+// + mp 头（上游 task_runner claim_one(mp=True) 同款）；chat 域 400 时降级 Web 域
+// 领奖端点（ClaimReward，x-client-platform: web 形态）。返回 (credit, energy, err)。
+func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
+	req, err := http.NewRequest(http.MethodPost,
+		c.chatBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	c.BillingHeaders(req, a)
+	req.Header.Set("X-Client-Platform", mpPlatform)
+	data, err := c.doJSON(req)
+	if err != nil {
+		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
+		if ue, ok := err.(*Error); ok && ue.Status == http.StatusBadRequest {
+			return c.ClaimReward(a, taskCode)
+		}
+		return 0, 0, err
+	}
+	return parseClaimReward(data)
+}
+
+// parseClaimReward 解析领奖响应 data：{"already_claimed":bool,"credit":n,"energy":n}。
+func parseClaimReward(data json.RawMessage) (credit, energy int64, err error) {
+	var resp struct {
+		AlreadyClaimed bool  `json:"already_claimed"`
+		Credit         int64 `json:"credit"`
+		Energy         int64 `json:"energy"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, 0, err
+	}
+	return resp.Credit, resp.Energy, nil
+}
+
+// parseGrowthTasks 解析 growth 任务列表 data.tasks[]（默认与 mp 口径共用）。
+func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 	var resp struct {
 		Tasks []struct {
 			TaskCode     string          `json:"task_code"`
@@ -145,7 +232,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	}
 	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
 	// 带 x-client-platform: web 标记来源端。
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
@@ -161,8 +248,8 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
 	}
 
 	data, err := c.doJSON(req)

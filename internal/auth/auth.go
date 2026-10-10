@@ -51,6 +51,46 @@ func (a *Auth) Lock() { a.mu.Lock() }
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
 
+// AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
+//
+// 为什么必须加锁：RefreshToken 在 a.mu 内改写 AccessToken/RefreshToken/Domain/ExpiresAt
+// （client.go「第 2 段（锁内）：校验快照一致后写回」），而所有出站请求头构造
+// （ChatHeaders / BillingHeaders / fetchEnterpriseModels / fetchV3Models /
+// global_models）与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
+// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
+// 就是池内同一个对象）。无同步直读构成数据竞争（go test -race 实证）。
+func (a *Auth) AccessTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.AccessToken
+}
+
+// DomainValue 加锁读取 Domain（同 AccessTokenValue：RefreshToken 在锁内改写它）。
+func (a *Auth) DomainValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Domain
+}
+
+// RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
+// 改写它）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
+// `a.RefreshToken == ""`）必须经此取值，勿直读字段。
+func (a *Auth) RefreshTokenValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.RefreshToken
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
@@ -71,6 +111,15 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
 func (a *Auth) Realm() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realmLocked()
+}
+
+// realmLocked Realm 的无锁内部实现：仅限**已持 a.mu** 的调用方使用（sync.Mutex 不可重入，
+// 锁内再调 Realm() 会自锁）。realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在锁内
+// 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
+func (a *Auth) realmLocked() string {
 	if !globalEnabled.Load() {
 		return "cn"
 	}
@@ -100,6 +149,8 @@ func ResolveRealm(explicit, domain string) string {
 // （SetGlobalEnabled(false)）下恒降级 cn，把 global 账号写死成 cn 会永久污染凭证
 // （逃生门是纯 CN 部署的临时锁，不应改写落盘数据）。domain 也为空时写 "cn"（老 CN 凭证）。
 func (a *Auth) BackfillRealm() (bool, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
@@ -109,7 +160,11 @@ func (a *Auth) BackfillRealm() (bool, string) {
 }
 
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
-func (a *Auth) RealmStored() string { return a.realm }
+func (a *Auth) RealmStored() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realm
+}
 
 // BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
 // global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
@@ -123,6 +178,8 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 	default:
 		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.realm == realm {
 		return false, nil
 	}
@@ -133,6 +190,25 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 
+// IsEnterprise 报告账号是否为企业版（auth 文件带非空 enterpriseId）。
+//
+// 企业版**没有个人成长体系**：签到 / 成长任务 / 连登管家 / 猫猫旅行 / 夜猫子
+// 在上游一律被拒——实测（2026-10-07，同一时刻 A/B 对照）：
+//   - POST /v2/billing/meter/daily-checkin                → 400 code 10001「企业账号不支持该操作」
+//   - POST /billing/meter/claim-gift / claim-compensation → 400 code 10001 同上
+//   - GET  /activity/growth/{streak,buddy/info,heatmap,lottery/summary}
+//     与 GET /v2/activity/growth/tasks                    → 403「growth system is only available for personal users」
+//
+// 因此引用处（scheduler 五类任务 + panel 成长任务/签到入口）必须与 IsGlobal 门控
+// 并列跳过，避免每日对注定失败的端点空发请求、面板按钮必然报错。
+//
+// 不受影响的能力：选号派发、保活（token 刷新）、额度查询（企业额度改走
+// /v2/billing/meter/get-enterprise-user-usage，见 upstream.enterpriseResource）。
+//
+// 直读字段（EnterpriseID 自 Parse 后不再改写，与 upstream 读取方式一致），
+// 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
+func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
@@ -142,6 +218,8 @@ func isGlobalDomain(d string) bool {
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.ExpiresAt <= 0 {
 		return true
 	}
@@ -301,15 +379,15 @@ func LoadDir(dir string) ([]*Auth, error) {
 		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
-				logfmt.UID8(a.UID), prev, f)
+				logfmt.Label(a.UID, a.Nickname), prev, f)
 		}
 		seenUID[a.UID] = f
 		if a.RealmStored() == "" {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.UID8(a.UID), err)
+					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
 				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.UID8(a.UID), a.Domain)
+					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
 				}
 			}
 		}

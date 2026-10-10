@@ -3,6 +3,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -753,29 +754,34 @@ func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
-func TestCooldownSoftStreakResetByReenable(t *testing.T) {
-	// 签到解冻（reviveCoolingLocked）清 cooling 域 → softStreak 一并归零；
-	// 熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+func TestCooldownSoftKeptByReenable(t *testing.T) {
+	// 签到/余额刷新解冻（reviveCoolingLocked）只解冻余额耗尽冷却（CoolHard）；
+	// 软限流冷却（CoolSoft）与 softStreak 保留——限流恢复证据是重置墙钟/退避到期，
+	// 不是余额恢复（余额刷新每 5 分钟一次，若在此清冷却域，限流保护实际寿命被压到
+	// 一个刷新周期内）。熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	expireCooldown(p, "u1") // 跨冷却期第二次限流，streak 累计到 2（冷却中重复触发不堆叠，#152）
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	failsBefore := p.breakerFails("u1")
 
 	p.ReenableIfCredits("u1", 500, 0)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 0 {
-		t.Errorf("reenable should reset soft_streak, got %d", st.SoftStreak)
+	if !st.Cooling {
+		t.Errorf("reenable 不得解除软限流冷却: %+v", st)
 	}
-	if st.Cooling {
-		t.Errorf("reenable should clear cooling: %+v", st)
+	if st.SoftStreak != 2 {
+		t.Errorf("reenable 不得清零软限流退避计数 soft_streak, got %d want 2", st.SoftStreak)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
 
+	// 退避延续：第 3 次触发从既有 streak=2 继续 → 600s<<2 = 2400s（而非归零后的 600s）。
+	expireCooldown(p, "u1")
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	wantCoolSec(t, p, "u1", 2400, 3)
 }
 
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
@@ -1731,5 +1737,257 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "AccessToken") || strings.Contains(string(raw), "RefreshToken") {
 		t.Fatalf("state.json contains credential field: %s", raw)
+	}
+}
+
+func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "later"})
+	p.Add(&auth.Auth{UID: "soon"})
+	p.Add(&auth.Auth{UID: "none"})
+
+	// later = 15d 档（次紧迫，权重 ×5），soon = 7d 档（最紧迫，权重 ×9），none = 无快过期。
+	p.SetCreditsDetailed("later", 100, 100, 0, 100)
+	p.SetCreditsDetailed("soon", 100, 100, 100, 0)
+	p.SetCreditsDetailed("none", 100, 100, 0, 0)
+
+	// 两档加权是软偏好而非硬优先。用确定性随机源统计长期分布：两个快过期账号的
+	// 合计份额应显著高于普通账号，7d 档（soon）又应高于 15d 档（later），
+	// 同时普通账号仍保留少量流量。
+	rng := rand.New(rand.NewPCG(1, 2))
+	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
+	counts := map[string]int{}
+	for i := 0; i < 2000; i++ {
+		got := p.Pick()
+		if got == nil {
+			t.Fatal("pick returned nil")
+		}
+		counts[got.UID]++
+	}
+	expiring := counts["soon"] + counts["later"]
+	if expiring <= counts["none"]*2 || counts["none"] == 0 || counts["soon"] <= counts["later"] {
+		t.Fatalf("two-tier distribution=%v, want expiring majority (soon>later) and regular non-zero", counts)
+	}
+}
+
+func TestPickExpiringTieUsesExistingWeight(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "small"})
+	p.Add(&auth.Auth{UID: "large"})
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	// 两号同为 15d 档、同占比 100%，权重差异只来自 credits 总量项 → large 胜出。
+	p.SetCreditsDetailed("small", 10, 10, 0, 10)
+	p.SetCreditsDetailed("large", 50, 50, 0, 50)
+
+	got := p.Pick()
+	if got == nil || got.UID != "large" {
+		t.Fatalf("pick=%v want large", got)
+	}
+}
+
+func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	now := time.Now()
+	p.SetCreditsDetailed("a", 100, 100, 50, 0)
+	p.SetCreditsDetailed("b", 100, 100, 0, 0)
+
+	p.mu.Lock()
+	wa := p.routingWeightOf(p.byUID["a"], 100, now)
+	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	p.mu.Unlock()
+	if wa <= wb {
+		t.Fatalf("enabled expiring weight=%v should exceed plain=%v", wa, wb)
+	}
+
+	p.SetPreferExpiring(false)
+
+	p.mu.Lock()
+	wa = p.routingWeightOf(p.byUID["a"], 100, now)
+	wb = p.routingWeightOf(p.byUID["b"], 100, now)
+	p.mu.Unlock()
+	if wa != wb {
+		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
+	}
+}
+
+func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 100, 100, 50, 40)
+
+	st, _ := p.Status("u1")
+	if st.CreditsExpiring7d != 50 || st.CreditsExpiring15d != 40 {
+		t.Fatalf("initial snapshot=%+v", st)
+	}
+
+	// 扣 10：先耗 7d 档（50→40），15d 档不动。
+	p.NoteModelCost("u1", "m", 10, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 90 || st.CreditsExpiring7d != 40 || st.CreditsExpiring15d != 40 {
+		t.Fatalf("after consume=%+v", st)
+	}
+
+	// 再扣 40：7d 档清空（40→0），扣减被 7d 档吃满，15d 档不动（仍 40）。
+	p.NoteModelCost("u1", "m", 40, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 50 || st.CreditsExpiring7d != 0 || st.CreditsExpiring15d != 40 {
+		t.Fatalf("after deeper consume=%+v", st)
+	}
+
+	// 再扣 50：两档一并清空。
+	p.NoteModelCost("u1", "m", 50, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 0 || st.CreditsExpiring7d != 0 || st.CreditsExpiring15d != 0 {
+		t.Fatalf("after exhaustion=%+v", st)
+	}
+
+	// 刷新归零：两档都清空。
+	p.SetCreditsDetailed("u1", 50, 50, 10, 10)
+	p.SetCreditsDetailed("u1", 50, 50, 0, 0)
+	st, _ = p.Status("u1")
+	if st.CreditsExpiring7d != 0 || st.CreditsExpiring15d != 0 {
+		t.Fatalf("zero refresh did not clear snapshot=%+v", st)
+	}
+}
+
+// ---------- 暂停选号（paused）----------
+//
+// paused 与 disabled 正交：两者都退出选号候选，但 paused 是「临时让位」——
+// 不清冷却域、不写 reason，且**保号任务照常参与**（见 scheduler 侧测试）。
+
+// TestPauseExitsRouting 暂停号退出选号（Pick 含全冷却兜底都不参与）。
+func TestPauseExitsRouting(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.Pause("u1") {
+		t.Fatal("Pause 对存在的账号应返回 true")
+	}
+	if got := p.Pick(); got != nil {
+		t.Fatalf("暂停号不应被选中, got %+v", got)
+	}
+	st, _ := p.Status("u1")
+	if !st.Paused {
+		t.Errorf("Status.Paused 应为 true: %+v", st)
+	}
+	if st.Disabled {
+		t.Errorf("暂停不是禁用：Disabled 必须为 false: %+v", st)
+	}
+}
+
+// TestPauseExcludesFromFallback 全冷却兜底同样不捞回暂停号（与 disabled 同口径）。
+func TestPauseExcludesFromFallback(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limited") // 迫使命中兜底路径
+	if got := p.Pick(); got != nil {
+		t.Fatalf("want nil（暂停号不入兜底）, got %+v", got)
+	}
+}
+
+// TestResumeRestoresRouting 解除暂停后立刻回到池子（无需重登或解冻）。
+func TestResumeRestoresRouting(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	if !p.Resume("u1") {
+		t.Fatal("Resume 对存在的账号应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.Paused {
+		t.Errorf("Resume 后 Paused 应为 false: %+v", st)
+	}
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("Resume 后应可选, got %+v", got)
+	}
+}
+
+// TestPauseDoesNotTouchCoolingDomain 暂停**不**清冷却域——与 disable 的关键区别：
+// disable 是终态故清冷却，pause 是临时态故保留观测（恢复后仍有效）。
+func TestPauseDoesNotTouchCoolingDomain(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limited")
+	p.Pause("u1")
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.Reason != "429 rate limited" {
+		t.Errorf("Pause 不应清冷却/原因: %+v", st)
+	}
+}
+
+// TestDisableClearsPaused 禁用是比暂停更强的终态：二者不叠加。
+func TestDisableClearsPaused(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	p.Disable("u1", "12153 session dead")
+	st, _ := p.Status("u1")
+	if st.Paused {
+		t.Errorf("disable 后 paused 应被清（不叠加）: %+v", st)
+	}
+	if !st.Disabled {
+		t.Errorf("应为 disabled: %+v", st)
+	}
+}
+
+// TestReviveClearsPaused 运维「解冻」是全清：paused 一并解除。
+func TestReviveClearsPaused(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.Paused {
+		t.Errorf("Revive 应清 paused: %+v", st)
+	}
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("Revive 后应可选, got %+v", got)
+	}
+}
+
+// TestPausePersists 暂停状态落盘，跨重启不丢（轮换用法要求）。
+func TestPausePersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if st, _ := p2.Status("u1"); !st.Paused {
+		t.Errorf("重载后 Paused 应保持: %+v", st)
+	}
+	if got := p2.Pick(); got != nil {
+		t.Fatalf("重载后暂停号仍不应可选, got %+v", got)
+	}
+}
+
+// TestPauseUnknownUIDReturnsFalse 不存在的 uid 返回 false（供面板区分 404）。
+func TestPauseUnknownUIDReturnsFalse(t *testing.T) {
+	p := New("")
+	if p.Pause("nope") {
+		t.Error("Pause 未知 uid 应返回 false")
+	}
+	if p.Resume("nope") {
+		t.Error("Resume 未知 uid 应返回 false")
+	}
+}
+
+// TestResumeIdempotent 对未暂停账号 Resume 是空操作（幂等，不改变状态）。
+func TestResumeIdempotent(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.Resume("u1") {
+		t.Fatal("Resume 幂等应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.Paused {
+		t.Errorf("Paused 应仍为 false: %+v", st)
 	}
 }

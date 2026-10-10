@@ -112,7 +112,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", desktopUA)
@@ -213,7 +213,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", desktopUA)
@@ -280,7 +280,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-client-platform", "web")
@@ -391,7 +391,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", desktopUA)
 	req.Header.Set("X-Domain", c.chatBase(a))
@@ -438,7 +438,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 		return "", "", err
 	}
 	h := req.Header
-	h.Set("Authorization", "Bearer "+a.AccessToken)
+	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
 	h.Set("User-Agent", desktopUA)
@@ -477,6 +477,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	// 从 SSE 流抓第一个 data.id 作为服务端 requestId（读干流避免残留连接）。
 	buf := make([]byte, 0, 1<<20)
 	tmp := make([]byte, 8192)
+	searchFrom := 0
 	for {
 		n, rerr := resp.Body.Read(tmp)
 		if n > 0 {
@@ -488,8 +489,12 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 				}
 				fmt.Printf("[dbg-rd %d] %q\n", n, dbg)
 			}
-			if i := bytes.Index(buf, []byte(`"id":"`)); i >= 0 {
-				rest := buf[i+6:]
+			// 从上次搜索位置继续：SSE 里 `"id":"` 可能先出现在消息 id 等字段，
+			// 若不推进偏移，首个不匹配的 id 会让循环永远重复命中同一位置，
+			// 读满 1MB 后误报"未找到 requestId"。
+			if i := bytes.Index(buf[searchFrom:], []byte(`"id":"`)); i >= 0 {
+				abs := searchFrom + i
+				rest := buf[abs+6:]
 				if end := bytes.IndexByte(rest, '"'); end > 0 {
 					id := string(rest[:end])
 					if os.Getenv("WB2A_DEBUG_CHAT") != "" {
@@ -498,6 +503,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 					if idRegex.MatchString(id) {
 						return conversationID, id, nil
 					}
+					searchFrom = abs + 1
 				}
 			}
 		}
